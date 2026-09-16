@@ -4426,7 +4426,34 @@ bool VkEmulation::updateColorBufferFromBytesLocked(uint32_t colorBufferHandle, u
     }
 
     static constexpr uint64_t ANB_MAX_WAIT_NS = 5ULL * 1000ULL * 1000ULL * 1000ULL;
-    VK_CHECK(vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS));
+    // VIMA fork (0008): retry once on VK_TIMEOUT instead of aborting the VM.
+    //
+    // Upstream already does exactly this in readColorBufferToBytesLocked -- same
+    // 5 s wait, same fence -- but never mirrored it into the other three users of
+    // mCommandBufferFence. The asymmetry looks like an oversight rather than a
+    // decision: nothing about an upload, or about a buffer rather than an image,
+    // makes a 5 s overrun less transient than it is for a colour-buffer readback.
+    //
+    // It is not theoretical here. A 2.5 h VIMA session died on the
+    // updateColorBufferFromBytesLocked one, with the guest actively rendering
+    // (TRANSFER_TO_HOST_3D right up to the failure), taking the whole VM down:
+    //
+    //   [vk_common_operations.cpp(4429)] VK_CHECK(vk->vkWaitForFences(...))
+    //       failed with VK_TIMEOUT
+    //
+    // A genuine GPU hang should still be loud, so a second timeout still aborts
+    // through VK_CHECK -- this only buys the same grace the read path has.
+    VkResult waitRes =
+        vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS);
+    if (waitRes == VK_TIMEOUT) {
+        GFXSTREAM_ERROR(
+            "updateColorBufferFromBytesLocked vkWaitForFences failed with timeout error "
+            "(cb:%d, x:%d, y:%d, w:%d, h:%d), retrying...",
+            colorBufferHandle, x, y, w, h);
+        waitRes =
+            vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS * 2);
+    }
+    VK_CHECK(waitRes);
 
     VK_CHECK(vk->vkResetFences(mDevice, 1, &mCommandBufferFence));
 
@@ -4869,7 +4896,34 @@ bool VkEmulation::readBufferToBytes(uint32_t bufferHandle, uint64_t offset, uint
 
     static constexpr uint64_t ANB_MAX_WAIT_NS = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 
-    VK_CHECK(vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS));
+    // VIMA fork (0008): retry once on VK_TIMEOUT instead of aborting the VM.
+    //
+    // Upstream already does exactly this in readColorBufferToBytesLocked -- same
+    // 5 s wait, same fence -- but never mirrored it into the other three users of
+    // mCommandBufferFence. The asymmetry looks like an oversight rather than a
+    // decision: nothing about an upload, or about a buffer rather than an image,
+    // makes a 5 s overrun less transient than it is for a colour-buffer readback.
+    //
+    // It is not theoretical here. A 2.5 h VIMA session died on the
+    // updateColorBufferFromBytesLocked one, with the guest actively rendering
+    // (TRANSFER_TO_HOST_3D right up to the failure), taking the whole VM down:
+    //
+    //   [vk_common_operations.cpp(4429)] VK_CHECK(vk->vkWaitForFences(...))
+    //       failed with VK_TIMEOUT
+    //
+    // A genuine GPU hang should still be loud, so a second timeout still aborts
+    // through VK_CHECK -- this only buys the same grace the read path has.
+    VkResult waitRes =
+        vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS);
+    if (waitRes == VK_TIMEOUT) {
+        GFXSTREAM_ERROR(
+            "readBufferToBytes vkWaitForFences failed with timeout error "
+            "(buffer:%d, offset:%llu, size:%llu), retrying...",
+            bufferHandle, (unsigned long long)offset, (unsigned long long)size);
+        waitRes =
+            vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS * 2);
+    }
+    VK_CHECK(waitRes);
 
     VK_CHECK(vk->vkResetFences(mDevice, 1, &mCommandBufferFence));
 
@@ -4982,7 +5036,34 @@ bool VkEmulation::updateBufferFromBytes(uint32_t bufferHandle, uint64_t offset, 
     }
 
     static constexpr uint64_t ANB_MAX_WAIT_NS = 5ULL * 1000ULL * 1000ULL * 1000ULL;
-    VK_CHECK(vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS));
+    // VIMA fork (0008): retry once on VK_TIMEOUT instead of aborting the VM.
+    //
+    // Upstream already does exactly this in readColorBufferToBytesLocked -- same
+    // 5 s wait, same fence -- but never mirrored it into the other three users of
+    // mCommandBufferFence. The asymmetry looks like an oversight rather than a
+    // decision: nothing about an upload, or about a buffer rather than an image,
+    // makes a 5 s overrun less transient than it is for a colour-buffer readback.
+    //
+    // It is not theoretical here. A 2.5 h VIMA session died on the
+    // updateColorBufferFromBytesLocked one, with the guest actively rendering
+    // (TRANSFER_TO_HOST_3D right up to the failure), taking the whole VM down:
+    //
+    //   [vk_common_operations.cpp(4429)] VK_CHECK(vk->vkWaitForFences(...))
+    //       failed with VK_TIMEOUT
+    //
+    // A genuine GPU hang should still be loud, so a second timeout still aborts
+    // through VK_CHECK -- this only buys the same grace the read path has.
+    VkResult waitRes =
+        vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS);
+    if (waitRes == VK_TIMEOUT) {
+        GFXSTREAM_ERROR(
+            "updateBufferFromBytes vkWaitForFences failed with timeout error "
+            "(buffer:%d, offset:%llu, size:%llu), retrying...",
+            bufferHandle, (unsigned long long)offset, (unsigned long long)size);
+        waitRes =
+            vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, ANB_MAX_WAIT_NS * 2);
+    }
+    VK_CHECK(waitRes);
 
     VK_CHECK(vk->vkResetFences(mDevice, 1, &mCommandBufferFence));
 
