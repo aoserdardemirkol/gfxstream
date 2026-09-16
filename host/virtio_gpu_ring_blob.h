@@ -22,6 +22,7 @@
 #endif
 #include "gfxstream/AlignedBuf.h"
 #include "gfxstream/memory/SharedMemory.h"
+#include "vima_shared_alloc.h"  // VIMA fork
 
 namespace gfxstream {
 namespace host {
@@ -30,12 +31,16 @@ namespace host {
 
 struct AlignedMemory {
     void* addr = nullptr;
+    size_t size = 0;  // VIMA fork: vima_shared_free needs the length
 
-    AlignedMemory(size_t align, size_t size) : addr(gfxstream::aligned_buf_alloc(align, size)) {}
+    // VIMA fork: shm-backed (MAP_SHARED) so VZVirtioSharedMemoryRegion.mapMemory
+    // accepts the pointer; posix_memalign heap crashes xpc_shmem_create.
+    AlignedMemory(size_t align, size_t sz)
+        : addr(gfxstream::vima_shared_alloc(align, sz)), size(sz) {}
 
     ~AlignedMemory() {
         if (addr != nullptr) {
-            gfxstream::aligned_buf_free(addr);
+            gfxstream::vima_shared_free(addr, size);
         }
     }
 

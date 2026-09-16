@@ -76,6 +76,7 @@ files_lib_gfxstream_backend = files(
   'virtio_gpu_pipe.cpp',
   'virtio_gpu_resource.cpp',
   'virtio_gpu_ring_blob.cpp',
+  'vima_shared_alloc.cpp',
   'virtio_gpu_timelines.cpp',
   'vsync_thread.cpp',
 )
