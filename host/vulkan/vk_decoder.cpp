@@ -330,7 +330,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                             if (!warned && warnUs != 0 && stalledUs >= warnUs) {
                                 warned = true;
                                 GFXSTREAM_ERROR(
-                                    "VIMA-0013 seqno stall: puid=%llu process=%s want=%u have=%u "
+                                    "seqno stall: puid=%llu process=%s want=%u have=%u "
                                     "gap=%u frozen %llums on thread=0x%x. Blocked packet is %s. "
                                     "This thread last decoded seqno=%d (%s). Every later Vulkan "
                                     "command from this process is blocked behind it.",
@@ -354,7 +354,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                                 const uint32_t target = seqno - 1;
                                 const bool advances = (int32_t)(target - have) > 0;
                                 GFXSTREAM_ERROR(
-                                    "VIMA-0013 seqno deadlock broken after %llums: puid=%llu "
+                                    "seqno deadlock broken after %llums: puid=%llu "
                                     "process=%s want=%u have=%u thread=0x%x. %s. The held-back "
                                     "packet is most likely vkDestroyFence, whose encoder blocks "
                                     "on ResourceTracker::mLock after taking its seqno but before "
@@ -23438,7 +23438,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     }
                     if (first) {
                         GFXSTREAM_ERROR(
-                            "VIMA-0010 UNKNOWN VULKAN OPCODE %u (packetLen=%u) from process=%s "
+                            "unknown Vulkan opcode %u (packetLen=%u) from process=%s "
                             "- skipping the packet and advancing the seqno so the process is not "
                             "deadlocked. Host gfxstream is older than the guest ICD, or the "
                             "stream is corrupt.",

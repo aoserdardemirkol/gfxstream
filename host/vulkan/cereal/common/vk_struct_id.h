@@ -32,7 +32,7 @@ struct vk_get_vk_struct_id;
         static constexpr VkStructureType id = ID; \
     };
 
-// VIMA R5.24 — needed by vk_find_struct<> in the provoking-vertex shim
+// needed by vk_find_struct<> in the provoking-vertex shim
 // (vk_decoder_global_state.cpp). Upstream never registers these because upstream
 // never has to answer the query itself.
 REGISTER_VK_STRUCT_ID(VkPhysicalDeviceProvokingVertexFeaturesEXT,

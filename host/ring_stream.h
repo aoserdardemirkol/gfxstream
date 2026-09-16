@@ -78,11 +78,7 @@ class RingStream final : public IOStream {
     static const uint32_t kMaxUnavailableReads = 8;
     uint32_t mUnavailableReadCount = 0;
 
-    // R5.94 watchdog state. Per-stream, not thread_local: a RenderThread can
-    // outlive any one park, and thread_local would leak state between contexts.
     uint64_t mVimaParkStartUs = 0;
-    bool mVimaParkLogged = false;
-    bool mVimaForcedError = false;
 
     size_t mXmits = 0;
     size_t mTotalRecv = 0;

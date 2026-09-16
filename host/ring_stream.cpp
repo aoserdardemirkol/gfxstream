@@ -301,162 +301,16 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
                     continue;
                 }
 
-                // VIMA fork (DIAG R5.92): if this consumer stays parked while the
-                // guest is waiting on us, say what the ring actually contains.
-                //
-                // The remaining Where Winds Meet freeze has the guest polling in
-                // vkQueueWaitIdle -> speculativeRead for a reply while every host
-                // consumer sits here. Patch 0006's one-second backstop is running
-                // (the stack shows beforeTimedRead/timedWait), the ring's own
-                // read/write positions are seq-cst, and R5.90/0010 rule out the
-                // seqno and unknown-opcode deadlocks -- so reading more code is
-                // not going to settle whether the guest's command is sitting
-                // unread or never arrived. Print it.
-                //
-                // Once per consumer after ~3 s parked, not per iteration.
                 {
                     const uint64_t now = gfxstream::base::getUnixTimeUs();
                     if (!mVimaParkStartUs) mVimaParkStartUs = now;
-                    if (!mVimaParkLogged && now - mVimaParkStartUs > 3000000) {
-                        mVimaParkLogged = true;
-                        // R5.93: dump the WHOLE transport state, not just the
-                        // ring. The guest hangs in ensureType1Finished(), which
-                        // waits on the AUXILIARY BUFFER protocol in
-                        // asg_ring_config -- not on the to_host ring at all. That
-                        // is why the earlier probe showed avail=0 and looked
-                        // innocent: it was reading the wrong side of the
-                        // transport.
-                        //
-                        // CORRECTION (R5.94): the guest_write_pos vs
-                        // host_consumed_pos "discriminator" this comment used to
-                        // describe is WRONG for this hang, and the data proved
-                        // it. Those two fields belong to the auxiliary-buffer
-                        // reuse sub-protocol (advanceWrite/get_available_for_write),
-                        // NOT to draining the descriptor ring.
-                        // ensureType1Finished never reads either one -- confirmed
-                        // from the guest disassembly, which touches only the
-                        // to_host ring and ring_config.in_error. The measured
-                        // values (guest_write_pos=0 while host_consumed_pos=509595)
-                        // are a third outcome the discriminator did not allow for,
-                        // which is what exposed the mistake. Kept in the dump
-                        // because they are cheap and occasionally informative, but
-                        // do not reason about THIS hang from them.
-                        //
-                        // in_error IS load-bearing: it is the one field the
-                        // guest's spin checks every iteration regardless of
-                        // read_pos visibility, which is what makes the R5.94
-                        // watchdog below possible.
-                        const asg_ring_config* cfg = mContext.ring_config;
-                        GFXSTREAM_ERROR(
-                            "VIMA-R5.93 parked>3s host_state=%u | to_host w=%u r=%u avail=%d | "
-                            "to_host_lg w=%u r=%u | from_host_lg w=%u r=%u | "
-                            "cfg{guest_write_pos=%u host_consumed_pos=%u mode=%u size=%u "
-                            "in_error=%u bufsz=%u flush=%u} | xmits=%llu recv=%llu",
-                            __atomic_load_n(mContext.host_state, __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&mContext.to_host->write_pos, __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&mContext.to_host->read_pos, __ATOMIC_SEQ_CST),
-                            (int)ring_buffer_available_read(mContext.to_host, 0),
-                            __atomic_load_n(&mContext.to_host_large_xfer.ring->write_pos,
-                                            __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&mContext.to_host_large_xfer.ring->read_pos,
-                                            __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&mContext.from_host_large_xfer.ring->write_pos,
-                                            __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&mContext.from_host_large_xfer.ring->read_pos,
-                                            __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&cfg->guest_write_pos, __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&cfg->host_consumed_pos, __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&cfg->transfer_mode, __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&cfg->transfer_size, __ATOMIC_SEQ_CST),
-                            __atomic_load_n(&cfg->in_error, __ATOMIC_SEQ_CST),
-                            cfg->buffer_size, cfg->flush_interval,
-                            (unsigned long long)mXmits, (unsigned long long)mTotalRecv);
-                    }
-                    // NOTE: an earlier version logged "DATA PENDING - lost wakeup
-                    // confirmed" here whenever the ring was non-empty at this
-                    // point. That was wrong and it fired 317 times in a session
-                    // that was mostly healthy. Reaching here means the re-check
-                    // above already found the ring empty, so finding data now
-                    // just means it arrived in the interval -- a race the
-                    // NEED_NOTIFY publish and the one-second backstop both
-                    // recover from. Only data still pending AFTER a long park is
-                    // evidence of anything, and the parked>3s line above reports
-                    // exactly that. Measured on the real freeze: every consumer
-                    // parked >3s had avail=0, i.e. NO lost wakeup.
-                }
-                // VIMA fork (0011 / R5.94): bound the damage of a read_pos the
-                // guest never observes.
-                //
-                // The guest spins in ensureType1Finished() until
-                // ring_buffer_available_read(to_host) == 0. It computes that from
-                // a PLAIN, non-atomic load of to_host->read_pos -- the field WE
-                // own and advance with a SEQ_CST RMW. Mixing a seq-cst writer with
-                // a plain reader is a data race, and this transport has already
-                // produced exactly this failure once before, on host_state, fixed
-                // by patch 0009. read_pos was never audited then.
-                //
-                // Unlike ensureConsumerFinishing() (which host_state drives, and
-                // which has a ping/notify escape), this loop has NO escape: if our
-                // advance never becomes visible, nothing brings the guest back.
-                // Measured at the freeze: we see to_host w == r (avail=0) while
-                // the guest keeps spinning, i.e. the two sides disagree about the
-                // same ring.
-                //
-                // We cannot fix the guest's load -- it is a prebuilt APEX binary.
-                // Two host-only mitigations, in escalating order:
-                //
-                //   1. Re-publish read_pos with a fresh SEQ_CST store + fence,
-                //      once per second while parked. Numerically a no-op; the
-                //      point is new coherence traffic. If the original advance
-                //      simply never crossed, this may carry it. THIS IS ALSO THE
-                //      EXPERIMENT: if re-publishing alone unwedges the guest, the
-                //      cause is visibility (H1). If only step 2 ever helps, it is
-                //      not, and the mapping itself is the next suspect (H2).
-                //
-                //   2. After 10 s, set in_error -- the ONE field this guest loop
-                //      checks every iteration regardless of read_pos visibility.
-                //      That releases the guest with an error rather than leaving
-                //      it hung forever, and lets the existing 0005/0006 backstop
-                //      retire this consumer. A lost context beats a lost session.
-                //
-                // Both re-verify the ring is STILL drained on a fresh read, so a
-                // straggler arriving in the interim is never mistaken for a hang.
-                if (mVimaParkStartUs) {
-                    const uint64_t parkedUs =
-                        gfxstream::base::getUnixTimeUs() - mVimaParkStartUs;
-                    if (parkedUs > 1000000 && !ring_buffer_available_read(mContext.to_host, 0)) {
+                    if (now - mVimaParkStartUs > 1000000 &&
+                        !ring_buffer_available_read(mContext.to_host, 0)) {
                         uint32_t rp;
                         __atomic_load(&mContext.to_host->read_pos, &rp, __ATOMIC_SEQ_CST);
                         __atomic_store_n(&mContext.to_host->read_pos, rp, __ATOMIC_SEQ_CST);
                         __atomic_thread_fence(__ATOMIC_SEQ_CST);
                     }
-                    // DO NOT force in_error here. This was tried and it is WRONG.
-                    //
-                    // The idea was: parked >10s with the ring provably drained
-                    // means the guest is stuck on a read_pos it never observed, so
-                    // release it via the one field its loop checks. The flaw is
-                    // that "parked with an empty ring" is ALSO the completely
-                    // normal idle state of every context that simply has nothing
-                    // to do, and from the host those two are indistinguishable --
-                    // no ring state, counter or flag separates "guest spinning in
-                    // ensureType1Finished waiting for us" from "guest asleep".
-                    //
-                    // Measured, on a freshly booted system with NO game running:
-                    // 44 contexts had in_error forced on them within a minute.
-                    // That is a fault injected into perfectly healthy contexts,
-                    // strictly worse than the hang it was meant to bound.
-                    //
-                    // The re-publish above stays: it is numerically a no-op, it
-                    // cannot harm an idle context, and it is the actual experiment
-                    // -- if the guest recovers within a second of parking, the
-                    // cause is read_pos visibility.
-                    //
-                    // A real escape needs a signal that distinguishes waiting from
-                    // idle, which the host does not currently have. The honest
-                    // options are: have the guest publish "I am waiting" (needs a
-                    // guest rebuild), or find such a signal. Do not reintroduce a
-                    // timeout-only version of this.
-                    (void)mVimaForcedError;
                 }
 
                 bool sleeping = false;
@@ -498,12 +352,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
     ++mXmits;
     mTotalRecv += count;
 
-    // Reset the park clock: this consumer is demonstrably alive. Without this the
-    // R5.94 watchdog would measure from the FIRST ever park and eventually fire
-    // in_error on a perfectly healthy context.
     mVimaParkStartUs = 0;
-    mVimaParkLogged = false;
-    mVimaForcedError = false;
 
     __atomic_store_n(mContext.host_state, ASG_HOST_STATE_RENDERING, __ATOMIC_SEQ_CST);
     return (const unsigned char*)buf;
