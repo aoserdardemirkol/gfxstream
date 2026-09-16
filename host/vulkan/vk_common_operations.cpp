@@ -3087,6 +3087,41 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     VkImageTiling tiling = (infoPtr->memoryProperty & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
                                ? VK_IMAGE_TILING_LINEAR
                                : VK_IMAGE_TILING_OPTIMAL;
+    // VIMA R5.44b — decouple this image's TILING from the memory's HOST_VISIBLE bit.
+    //
+    // The defect (R5.43): a guest resource created with VIRGL_BIND_LINEAR becomes a
+    // HOST_VISIBLE ColorBuffer, which the line above turns into a LINEAR image. The
+    // guest then imports that same allocation and creates its OWN VkImage for
+    // sampling — always VK_IMAGE_TILING_OPTIMAL (measured, R5.40). Two images alias
+    // one allocation with incompatible tiling, no error is raised anywhere, and the
+    // sampler reads garbage. It is NOT YUV-specific: R8G8B8X8_UNORM arrives with the
+    // identical bind flags (R5.43b).
+    //
+    // HOST_VISIBLE is kept: it is required by the existing ColorBuffer
+    // allocation/mapping machinery. Only the IMAGE's tiling changes, and only for
+    // images that are externally shareable — i.e. exactly those the guest can alias.
+    // The audit (R5.44a.1) found no consumer that requires this image to be LINEAR:
+    // 0 of 113 ColorBuffer allocations were ever CPU-mapped by the guest, and every
+    // path that touches image bytes goes through a staging buffer and a GPU copy.
+    //
+    // Scoped deliberately to the external-sharing condition below (the same predicate
+    // that attaches VkExternalMemoryImageCreateInfo), NOT to HOST_VISIBLE alone and
+    // NOT to any format, so non-shared ColorBuffers that legitimately want a linear
+    // image representation are untouched.
+    //
+    // VIMA_CB_LINEAR_TILING_FIX=0 restores the old behaviour, so the R5.45 matrix can
+    // reproduce the baseline without rebuilding.
+    const bool externallyShareable =
+        mDeviceInfo.supportsExternalMemoryExport || mDeviceInfo.supportsExternalMemoryImport;
+    const bool tilingFixEnabled =
+        gfxstream::base::getEnvironmentVariable("VIMA_CB_LINEAR_TILING_FIX") != "0";
+    if (tilingFixEnabled && externallyShareable && tiling == VK_IMAGE_TILING_LINEAR) {
+        GFXSTREAM_INFO("VIMA R5.44b cb=%u %s: LINEAR -> OPTIMAL "
+                       "(externally shareable; HOST_VISIBLE memory retained)",
+                       colorBufferHandle, string_VkFormat(vkFormat));
+        tiling = VK_IMAGE_TILING_OPTIMAL;
+    }
+
     std::unique_ptr<VkImageCreateInfo> imageCi = generateColorBufferVkImageCreateInfoLocked(
         vkFormat, infoPtr->width, infoPtr->height, tiling, mipLevels);
     // pNext will be filled later.
