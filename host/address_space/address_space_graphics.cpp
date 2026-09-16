@@ -562,7 +562,49 @@ AddressSpaceGraphicsContext::AddressSpaceGraphicsContext(
 AddressSpaceGraphicsContext::~AddressSpaceGraphicsContext() {
     if (mCurrentConsumer) {
         mExiting = 1;
-        mConsumerMessages.send(ConsumerCommand::Exit);
+
+        // VIMA fork (0007): this must never block, and upstream's send() does.
+        //
+        // mConsumerMessages holds FOUR messages, and every guest
+        // ASG_NOTIFY_AVAILABLE ping trySends a Wakeup into it (see perform(),
+        // ASG_NOTIFY_AVAILABLE). A guest process that is being torn down keeps
+        // pinging while its consumer is on its way out, so the channel is
+        // routinely full by the time we get here. A blocking send() then waits
+        // for a drain that will never come, because the only thread that drains
+        // it is the consumer we have not asked to exit yet.
+        //
+        // The consequence is not a stuck destructor in isolation. It is a
+        // PERMANENT host memory leak:
+        //
+        //   ~AddressSpaceGraphicsContext blocks in send(Exit)
+        //     -> mConsumerInterface.destroy() never runs, so the render thread
+        //        for this context never exits
+        //     -> FrameBuffer::cleanupProcGLObjects spins in its
+        //        "wait until no RenderThreadInfo carries this puid" loop
+        //     -> the process cleanup callbacks never run, so the guest's
+        //        VkInstance and everything under it is never destroyed
+        //     -> and because ProcessCleanupThread is a SERIAL worker, no LATER
+        //        process is ever cleaned either.
+        //
+        // Measured with the R5.78 instrumentation: cycle 1 of a Where Winds Meet
+        // launch/force-stop cleaned up in 30 ms; cycle 2 was still waiting after
+        // 43 s and never finished, with phys_footprint parked at 1844 MB against
+        // a 553 MB baseline. Upstream half-knows about this — VirtioGpuContext::
+        // Destroy carries "Note: this can hang as is but this has only been
+        // observed to happen during shutdown. See b/329287602#comment8." It is
+        // not only during shutdown here; it happens every time an app that
+        // drives the ASG hard is killed.
+        //
+        // trySend is best-effort and correct on its own terms: if the message
+        // lands, the consumer gets a clean Exit. stop() is what GUARANTEES it
+        // leaves either way — it wakes anything parked in timedReceive and makes
+        // every later receive return empty with isStopped() true, which
+        // onUnavailableRead (patch 0006) maps to kExit. Nothing sends on this
+        // channel after the destructor starts, and send() on a stopped channel
+        // returns false rather than blocking, so stopping it here is safe.
+        mConsumerMessages.trySend(ConsumerCommand::Exit);
+        mConsumerMessages.stop();
+
         mConsumerInterface.destroy(mCurrentConsumer);
     }
 
