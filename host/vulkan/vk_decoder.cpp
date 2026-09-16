@@ -42,6 +42,9 @@
 #include "gfxstream/common/logging.h"
 #include "gfxstream/host/iostream.h"
 #include "gfxstream/host/tracing.h"
+#include <mutex>
+#include <unordered_set>
+
 #include "gfxstream/system/System.h"
 #include "gfxstream/threads/Thread.h"
 #include "goldfish_vk_private_defs.h"
@@ -23205,12 +23208,60 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
             }
 #endif
             default: {
+                // VIMA fork (0010): an unknown opcode must NOT wedge the process.
+                //
+                // Upstream returns here without touching the sequence number.
+                // Every one of the 392 known opcodes ends with
+                // seqnoPtr->fetch_add(1), and commands from a process are
+                // decoded in seqno order, so a single unknown opcode consumes
+                // its slot and never advances the counter -- and every later
+                // command from that process then spins forever waiting for a
+                // seqno that can no longer arrive. One unimplemented call
+                // permanently deadlocks the whole guest process.
+                //
+                // That is the observed Where Winds Meet freeze. The R5.90
+                // diagnostic caught it exactly:
+                //
+                //   VIMA-R5.90 seqno spin STUCK >2s: process=com.netease.yysls-228
+                //       want=157867 have=157865 (need have==want-1)
+                //
+                // want - have == 2 where 1 is required: precisely one missing
+                // increment, not a stalled stream.
+                //
+                // packetLen is known from the packet header, so the packet can be
+                // skipped cleanly. Skipping means the call's effects do not
+                // happen, which may show up later as an artefact or an error --
+                // but that is strictly better than an unrecoverable hang, and the
+                // log line below names the opcode so the gap can be closed
+                // properly. Logged once per opcode value, since a repeating
+                // unknown call would otherwise flood.
+                {
+                    static std::mutex sVimaUnknownMutex;
+                    static std::unordered_set<uint32_t> sVimaUnknownOpcodes;
+                    bool first = false;
+                    {
+                        std::lock_guard<std::mutex> lk(sVimaUnknownMutex);
+                        first = sVimaUnknownOpcodes.insert(opcode).second;
+                    }
+                    if (first) {
+                        GFXSTREAM_ERROR(
+                            "VIMA-0010 UNKNOWN VULKAN OPCODE %u (packetLen=%u) from process=%s "
+                            "- skipping the packet and advancing the seqno so the process is not "
+                            "deadlocked. Host gfxstream is older than the guest ICD, or the "
+                            "stream is corrupt.",
+                            opcode, packetLen, processName ? processName : "null");
+                    }
+                }
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->destroyApiCallInfoIfUnused(snapshotApiCallHandle);
                 }
 
                 m_pool.freeAll();
-                return ptr - (unsigned char*)buf;
+                if (m_queueSubmitWithCommandsEnabled && seqnoPtr && !m_forSnapshotLoad) {
+                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
+                }
+                ptr += packetLen;
+                continue;
             }
         }
 
