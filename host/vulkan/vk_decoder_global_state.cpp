@@ -175,6 +175,13 @@ static constexpr const char* const kEmulatedDeviceExtensions[] = {
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
 #endif
+#if defined(__APPLE__)
+    // VIMA R5.24 — MoltenVK does not implement VK_EXT_provoking_vertex (Metal's
+    // provoking vertex is fixed to the FIRST vertex and there is no public API to
+    // change it), so it must never reach vkCreateDevice on the host. We advertise
+    // it to the guest anyway; see on_vkEnumerateDeviceExtensionProperties.
+    VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+#endif
 };
 
 // A list of instance extensions that should not be passed to the host driver.
@@ -1528,6 +1535,21 @@ class VkDecoderGlobalState::Impl {
             ycbcrFeatures->samplerYcbcrConversion |= m_vkEmulation->isYcbcrEmulationEnabled();
         }
 
+#if defined(__APPLE__)
+        // VIMA R5.24 — MoltenVK leaves this struct untouched (it does not know the
+        // extension), so without filling it in ANGLE reads whatever the guest
+        // zero-initialised and keeps provokingVertex disabled. See the advertise
+        // block in on_vkEnumerateDeviceExtensionProperties for the trade being made.
+        VkPhysicalDeviceProvokingVertexFeaturesEXT* provokingVertexFeatures =
+            vk_find_struct<VkPhysicalDeviceProvokingVertexFeaturesEXT>(pFeatures);
+        if (provokingVertexFeatures != nullptr) {
+            provokingVertexFeatures->provokingVertexLast = VK_TRUE;
+            // We do not claim the transform-feedback interaction: there is no
+            // VK_EXT_transform_feedback here either.
+            provokingVertexFeatures->transformFeedbackPreservesProvokingVertex = VK_FALSE;
+        }
+#endif
+
         // Disable a set of Vulkan features if BypassVulkanDeviceFeatureOverrides is NOT enabled.
         if (!m_vkEmulation->getFeatures().BypassVulkanDeviceFeatureOverrides.enabled()) {
             VkPhysicalDeviceVulkan11Features* vk11Features =
@@ -1860,6 +1882,20 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
+#if defined(__APPLE__)
+        // VIMA R5.24 — the properties half of the advertised extension. Both are
+        // FALSE and that is the honest answer: the mode cannot be varied per
+        // pipeline because it cannot be varied at all, and there is no transform
+        // feedback here to preserve anything.
+        VkPhysicalDeviceProvokingVertexPropertiesEXT* provokingVertexProperties =
+            vk_find_struct<VkPhysicalDeviceProvokingVertexPropertiesEXT>(pProperties);
+        if (provokingVertexProperties != nullptr) {
+            provokingVertexProperties->provokingVertexModePerPipeline = VK_FALSE;
+            provokingVertexProperties->transformFeedbackPreservesTriangleFanProvokingVertex =
+                VK_FALSE;
+        }
+#endif
+
         m_vkEmulation->applyApiVersionLimits(pProperties->properties.apiVersion);
     }
 
@@ -2045,6 +2081,35 @@ class VkDecoderGlobalState::Impl {
         }
 #endif
 
+#if defined(__APPLE__)
+        // VIMA R5.24 — advertise VK_EXT_provoking_vertex even though MoltenVK has
+        // no such extension.
+        //
+        // Why this is the whole ES3 story: ANGLE's Vulkan backend caps
+        // maxSupportedESVersion at {2,0} when mFeatures.provokingVertex is off
+        // (vk_renderer.cpp, Renderer::getMaxSupportedESVersion — "VK_EXT_provoking_vertex
+        // is required for flat shading"). Every other gate in that function passes
+        // on this device, and so do both ES3.1 gates. So this one absent extension
+        // is why all of Android runs on OpenGL ES 2.0 here, and why no ES3 game
+        // starts.
+        //
+        // What we are actually promising: provokingVertexLast == VK_TRUE. Metal
+        // renders first-vertex and we cannot change that, so a `flat`-qualified
+        // varying takes the FIRST vertex's value rather than the last. That is a
+        // real conformance deviation, deliberately taken, and it is confined to flat
+        // shading — nothing else in ES3 depends on it. It costs nothing at runtime:
+        // no emulation, no extra pass, no per-draw work. Implementing it correctly
+        // would mean rewriting index buffers on every draw, which is the option that
+        // WOULD cost performance.
+        if (!hasDeviceExtension(properties, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) {
+            VkExtensionProperties pv_props{};
+            strncpy(pv_props.extensionName, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+                    sizeof(pv_props.extensionName) - 1);
+            pv_props.specVersion = VK_EXT_PROVOKING_VERTEX_SPEC_VERSION;
+            properties.push_back(pv_props);
+        }
+#endif
+
         if (m_vkEmulation->isYcbcrEmulationEnabled() &&
             !hasDeviceExtension(properties, VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME)) {
             VkExtensionProperties ycbcr_props;
@@ -2156,6 +2221,27 @@ class VkDecoderGlobalState::Impl {
                 }
             }
         }
+
+#if defined(__APPLE__)
+        // VIMA R5.24 — the guest took us up on the advertised VK_EXT_provoking_vertex
+        // and ANGLE chains VkPhysicalDeviceProvokingVertexFeaturesEXT into
+        // VkDeviceCreateInfo with provokingVertexLast = VK_TRUE. Filtering the
+        // extension NAME (kEmulatedDeviceExtensions) is not enough: MoltenVK still
+        // sees the feature struct, cannot honour it, and answers
+        // VK_ERROR_FEATURE_NOT_PRESENT — which showed up as a boot-blocking
+        // "Failed to create VkDevice" loop. Unlink the struct too.
+        {
+            auto* prev = reinterpret_cast<VkBaseOutStructure*>(&createInfoFiltered);
+            while (prev->pNext) {
+                if (prev->pNext->sType ==
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT) {
+                    prev->pNext = prev->pNext->pNext;
+                    continue;
+                }
+                prev = prev->pNext;
+            }
+        }
+#endif
 
 #if defined(__ANDROID__)
         updatedDeviceExtensions.push_back("VK_ANDROID_external_memory_android_hardware_buffer");
