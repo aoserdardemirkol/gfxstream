@@ -249,7 +249,29 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
 
             ++mUnavailableReadCount;
             if (mUnavailableReadCount >= kMaxUnavailableReads) {
-                *(mContext.host_state) = ASG_HOST_STATE_NEED_NOTIFY;
+                // VIMA fork (0005): publish NEED_NOTIFY with a seq-cst store and
+                // a full fence, then re-check the ring before parking. Upstream's
+                // plain store is only safe on x86-TSO; on the Apple VZ shm ring
+                // (patch 0002, weakly ordered ARM64) the guest can read
+                // host_state stale, skip its ASG_NOTIFY_AVAILABLE ping, and this
+                // consumer would then block forever in onUnavailableRead() with
+                // data sitting in the ring — wedging the context and pinning any
+                // sibling RenderThread that spins on the process seqno. The
+                // seq-cst store + re-check establishes a total order: either the
+                // guest observes NEED_NOTIFY and pings, or this re-check observes
+                // the data the guest already wrote. Idle contexts still block at
+                // zero CPU.
+                __atomic_store_n(mContext.host_state, ASG_HOST_STATE_NEED_NOTIFY,
+                                 __ATOMIC_SEQ_CST);
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                if (ring_buffer_available_read(mContext.to_host, 0) ||
+                    ring_buffer_available_read(mContext.to_host_large_xfer.ring,
+                                               &mContext.to_host_large_xfer.view)) {
+                    __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME,
+                                     __ATOMIC_SEQ_CST);
+                    mUnavailableReadCount = 0;
+                    continue;
+                }
 
                 bool sleeping = false;
                 do {

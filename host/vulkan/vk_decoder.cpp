@@ -174,6 +174,12 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                         _mm_pause();
 #elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
                         __asm__ __volatile__("pause;");
+#elif (defined(__GNUC__) && (defined(__aarch64__) || defined(__arm__)))
+                        // VIMA fork (0005): upstream leaves this spin body empty
+                        // on ARM, so a stalled process seqno pins a core at 100%
+                        // (seen on Apple Silicon: ~1 full core per wedged
+                        // RenderThread). yield is the ARM spin-wait hint.
+                        __asm__ __volatile__("yield" ::: "memory");
 #endif
                     }
                     m_prevSeqno = seqno;

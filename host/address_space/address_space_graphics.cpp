@@ -621,7 +621,16 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
 
 AsgOnUnavailableReadStatus AddressSpaceGraphicsContext::onUnavailableRead() {
     ConsumerCommand cmd;
-    mConsumerMessages.receive(&cmd);
+    // VIMA fork (0005): a slow safety timeout so a genuinely lost wakeup can
+    // never hang a context forever. The real race fix is the seq-cst store +
+    // ring re-check in RingStream::readRaw before it calls this; this 1 s poll
+    // is only a backstop and should never fire in practice, so its cost is
+    // negligible (one wakeup per second per idle context).
+    const auto maybeCmd = mConsumerMessages.timedReceive(1000000 /* us */);
+    if (!maybeCmd) {
+        return AsgOnUnavailableReadStatus::kContinue;
+    }
+    cmd = *maybeCmd;
     switch (cmd) {
         case ConsumerCommand::Wakeup:
             return AsgOnUnavailableReadStatus::kContinue;
