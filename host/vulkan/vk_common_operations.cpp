@@ -52,6 +52,8 @@
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <vulkan/vulkan_beta.h>  // for MoltenVK portability extensions
+#include <vulkan/vulkan_metal.h>  // VkImportMetalTextureInfoEXT (VIMA fork)
+#include "vima_metal_import.h"
 #endif
 
 #if defined(__QNX__)
@@ -1460,6 +1462,22 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
             selectedDeviceExtensionNames.emplace(extension);
         }
     }
+    // VIMA (R2.3.7-decision-4 §A2.2, corrected in R3.2) — VK_EXT_metal_objects on
+    // VkEmulation's OWN device. This used to sit inside the `useMoltenVK` guard
+    // above, which is not taken on our configuration, so the extension was never
+    // enabled and vkGetDeviceProcAddr(mDevice, "vkExportMetalObjectsEXT") returned
+    // NULL (measured: dispatch=0x0 direct=0x0). That silently disabled both the
+    // E0 diagnostic and -- since R3.2 -- the ColorBuffer texture export that
+    // Option B presents from. `extensionSupported` already gates on the physical
+    // device, so the moltenVK flag adds nothing here.
+    const bool vimaMetalObjectsSupported = vk_util::extensionSupported(
+        emulation->mDeviceInfo.extensions, VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+    if (vimaMetalObjectsSupported) {
+        selectedDeviceExtensionNames.emplace(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+    }
+    GFXSTREAM_INFO("VIMA HOSTDEV metal_objects supported=%d enabled=%d useMoltenVK=%d",
+                   vimaMetalObjectsSupported ? 1 : 0, vimaMetalObjectsSupported ? 1 : 0,
+                   useMoltenVK ? 1 : 0);
 #endif
 
     if (emulation->mDeviceInfo.robustness2Features) {
@@ -3094,6 +3112,31 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
         imageCi->pNext = &extImageCi;
     }
 
+#if defined(__APPLE__)
+    // VIMA fork (R2.3): if the embedder wants to own this ColorBuffer's storage,
+    // it hands us an id<MTLTexture> (over an IOSurface). Chain
+    // VkImportMetalTextureInfoEXT so MoltenVK backs the VkImage with that exact
+    // texture; the vkAllocateMemory/vkBindImageMemory below then run as a no-op
+    // formality (the pixels go to the imported surface -- verified in R-S sec V3).
+    VkImportMetalTextureInfoEXT vimaImportMetalTex = {
+        VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT};
+    void* vimaMtlTex = nullptr;   // E0 (R2.3.7-decision-2): compared against infoPtr->memory.externalMetalHandle
+    if (auto vimaProvider = gfxstream_vima_get_metal_texture_provider()) {
+        void* mtlTex = vimaProvider(colorBufferHandle, infoPtr->width, infoPtr->height,
+                                    static_cast<int>(vkFormat));
+        vimaMtlTex = mtlTex;
+        if (mtlTex) {
+            vimaImportMetalTex.plane = VK_IMAGE_ASPECT_COLOR_BIT;
+            vimaImportMetalTex.mtlTexture = reinterpret_cast<MTLTexture_id>(mtlTex);
+            vimaImportMetalTex.pNext = imageCi->pNext;  // chain in front of extImageCi
+            imageCi->pNext = &vimaImportMetalTex;
+            infoPtr->vimaMetalImported = true;
+            GFXSTREAM_INFO("VIMA: ColorBuffer %u backed by embedder MTLTexture %p",
+                           colorBufferHandle, mtlTex);
+        }
+    }
+#endif
+
     auto vk = mDvk;
 
     VkResult createRes = vk->vkCreateImage(mDevice, imageCi.get(), nullptr, &infoPtr->image);
@@ -3173,6 +3216,70 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
                         string_VkResult(bindImageMemoryRes));
         return false;
     }
+
+#if defined(__APPLE__)
+    // E0 (R2.3.7-decision-2 §B) — the split-storage check. `infoPtr->image` is
+    // the VIMA-imported MTLTexture; `infoPtr->memory.externalMetalHandle` is what
+    // the GUEST imports (getColorBufferMetalMemoryHandle) and renders into. If
+    // these are different Metal objects, the guest render lands nowhere VIMA
+    // presents. This line stays permanently — it is the invariant FIX-A restores.
+    if (infoPtr->vimaMetalImported) {
+        GFXSTREAM_INFO("VIMA E0: CB %u image-tex=%p mem-handle=%p same=%d imgMemReqSize=%llu",
+                       colorBufferHandle, vimaMtlTex,
+                       reinterpret_cast<void*>(infoPtr->memory.externalMetalHandle),
+                       vimaMtlTex == reinterpret_cast<void*>(infoPtr->memory.externalMetalHandle) ? 1 : 0,
+                       (unsigned long long)infoPtr->imageMemReqs.size);
+    }
+
+    // R3.2 (Option B) — hand VIMA the ColorBuffer's OWN MTLTexture to composite.
+    // The image above is bound to `infoPtr->memory`, which is the same memory the
+    // guest imports (getColorBufferMetalMemoryHandle) and renders into — DE9 proved
+    // MoltenVK honours that heap sharing at TILING_OPTIMAL. So this texture IS the
+    // guest's render target: one storage, no copy, no import of ours.
+    //
+    // vkExportMetalObjectsEXT is resolvable here because VK_EXT_metal_objects is
+    // enabled on VkEmulation's own mDevice (see ~:1470).
+    if (auto sink = gfxstream_vima_get_colorbuffer_texture_sink()) {
+        // The generated dispatch table for mDevice does NOT carry
+        // vkExportMetalObjectsEXT even though VK_EXT_metal_objects is in
+        // mDevice's enabled-extension list (~:1470) -- measured: 55 calls, every
+        // one with vk->vkExportMetalObjectsEXT == nullptr. Resolve it directly
+        // instead of trusting the table. (The guest device's dispatch does carry
+        // it, which is why the E0-guest oracle works.)
+        static PFN_vkExportMetalObjectsEXT sExportFn = nullptr;
+        static bool sResolved = false;
+        if (!sResolved) {
+            sResolved = true;
+            if (vk->vkGetDeviceProcAddr) {
+                sExportFn = reinterpret_cast<PFN_vkExportMetalObjectsEXT>(
+                    vk->vkGetDeviceProcAddr(mDevice, "vkExportMetalObjectsEXT"));
+            }
+            if (!sExportFn) sExportFn = vk->vkExportMetalObjectsEXT;
+            GFXSTREAM_INFO("VIMA CBTEX resolve vkExportMetalObjectsEXT: dispatch=%p direct=%p",
+                           reinterpret_cast<void*>(vk->vkExportMetalObjectsEXT),
+                           reinterpret_cast<void*>(sExportFn));
+        }
+        if (sExportFn) {
+            VkExportMetalTextureInfoEXT et = {VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT};
+            et.image = infoPtr->image;
+            et.plane = VK_IMAGE_ASPECT_COLOR_BIT;
+            VkExportMetalObjectsInfoEXT eo = {VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
+            eo.pNext = &et;
+            sExportFn(mDevice, &eo);
+            void* tex = reinterpret_cast<void*>(et.mtlTexture);
+            GFXSTREAM_INFO("VIMA CBTEX cb=%u tex=%p %ux%u fmt=%d imported=%d", colorBufferHandle,
+                           tex, infoPtr->width, infoPtr->height, static_cast<int>(vkFormat),
+                           infoPtr->vimaMetalImported ? 1 : 0);
+            if (tex) {
+                sink(colorBufferHandle, tex, infoPtr->width, infoPtr->height,
+                     static_cast<int>(vkFormat));
+            }
+        } else {
+            GFXSTREAM_ERROR("VIMA CBTEX cb=%u: vkExportMetalObjectsEXT unresolvable on mDevice",
+                            colorBufferHandle);
+        }
+    }
+#endif
 
     VkSamplerYcbcrConversionInfo ycbcrInfo = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,

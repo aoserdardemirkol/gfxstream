@@ -27,6 +27,13 @@
 #include "vulkan/vk_enum_string_helper.h"
 #include "vulkan_dispatch.h"
 
+#if defined(__APPLE__)
+#include <vulkan/vulkan_metal.h>   // VkImportMetalTextureInfoEXT (VIMA FIX-A")
+extern "C" {
+#include "vima_metal_import.h"
+}
+#endif
+
 namespace gfxstream {
 namespace host {
 namespace vk {
@@ -208,6 +215,55 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
             GFXSTREAM_FATAL("Unhandled VkExternalMemoryImageCreateInfo in the pNext chain.");
         }
 
+#if defined(__APPLE__)
+        // VIMA FIX-A" (R2.3.7-decision-3) — the split-storage fix. The host CB's
+        // VkImage is backed by a VIMA MTLTexture (VkImportMetalTextureInfoEXT in
+        // createVkColorBufferLocked), but its VkDeviceMemory is an orphan; the
+        // guest imports the orphan and renders there, so VIMA presents an empty
+        // surface. Chain the SAME import onto this guest render image so guest
+        // image and host CB image are one MTLTexture / one IOSurface. Proven
+        // host-only in DE7. Guarded: only when the CB is VIMA-provided and the
+        // provider returns a texture for this format (multi-plane / unsupported
+        // → provider returns null → fall through unchanged).
+        VkImportMetalTextureInfoEXT vimaImportTex = {
+            VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT};
+        void* vimaGuestProviderTex = nullptr;
+        if (importedColorBufferInfo.vimaMetalImported) {
+            if (auto prov = gfxstream_vima_get_metal_texture_provider()) {
+                vimaGuestProviderTex = prov(importedColorBufferHandle,
+                                            importedColorBufferInfo.width,
+                                            importedColorBufferInfo.height,
+                                            static_cast<int>(createImageCi.format));
+            }
+            if (vimaGuestProviderTex) {
+                vimaImportTex.plane = VK_IMAGE_ASPECT_COLOR_BIT;
+                vimaImportTex.mtlTexture =
+                    reinterpret_cast<MTLTexture_id>(vimaGuestProviderTex);
+                // chained below, after extImageCi, so it lands FIRST in the
+                // pNext chain — matching createVkColorBufferLocked's order.
+                GFXSTREAM_INFO(
+                    "VIMA FIX-A\": ANB guest image for CB %u chains "
+                    "VkImportMetalTextureInfoEXT at provider-tex=%p (format=%s "
+                    "usage=0x%x flags=0x%x samples=%d tiling=%d exportFn=%p)",
+                    importedColorBufferHandle, vimaGuestProviderTex,
+                    string_VkFormat(createImageCi.format), createImageCi.usage,
+                    createImageCi.flags, (int)createImageCi.samples, (int)createImageCi.tiling,
+                    reinterpret_cast<void*>(vk->vkExportMetalObjectsEXT));
+            } else {
+                GFXSTREAM_ERROR(
+                    "VIMA FIX-A\": CB %u is vimaMetalImported but the provider "
+                    "returned no texture for the guest image (format=%s) -- "
+                    "falling through; guest render will NOT reach the IOSurface",
+                    importedColorBufferHandle, string_VkFormat(createImageCi.format));
+            }
+        }
+        // VIMA ROUTE (decision-3 D2) -- this hook fired for CB N. Counts, not a cap.
+        GFXSTREAM_INFO("VIMA ROUTE anb cb=%u vimaImported=%d imported=%d",
+                       importedColorBufferHandle,
+                       importedColorBufferInfo.vimaMetalImported ? 1 : 0,
+                       vimaGuestProviderTex ? 1 : 0);
+#endif
+
         // Create the image with extension structure about external backing.
         VkExternalMemoryImageCreateInfo extImageCi = {
             VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -215,6 +271,9 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
             static_cast<VkExternalMemoryHandleTypeFlags>(emu->getDefaultExternalMemoryHandleType()),
         };
         vk_insert_struct(createImageCi, extImageCi);
+#if defined(__APPLE__)
+        if (vimaGuestProviderTex) vk_insert_struct(createImageCi, vimaImportTex);  // FIX-A" — first in chain
+#endif
 
         VkResult createResult =
             vk->vkCreateImage(out->mDevice, &createImageCi, pAllocator, &out->mImage);
@@ -222,8 +281,40 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
             return nullptr;
         }
 
+#if defined(__APPLE__)
+        // VIMA E0-guest (decision-3 D2 / P8 F-SPLIT) — the structural predicate the
+        // whole fix exists to make true, checkable per resource with no pixels.
+        if (vimaGuestProviderTex && vk->vkExportMetalObjectsEXT) {
+            VkExportMetalTextureInfoEXT et = {
+                VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT};
+            et.image = out->mImage;
+            et.plane = VK_IMAGE_ASPECT_COLOR_BIT;
+            VkExportMetalObjectsInfoEXT eo = {
+                VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
+            eo.pNext = &et;
+            vk->vkExportMetalObjectsEXT(out->mDevice, &eo);
+            GFXSTREAM_INFO(
+                "VIMA E0-guest cb=%u guest-image-tex=%p provider-tex=%p same=%d",
+                importedColorBufferHandle, reinterpret_cast<void*>(et.mtlTexture),
+                vimaGuestProviderTex,
+                (reinterpret_cast<void*>(et.mtlTexture) == vimaGuestProviderTex) ? 1 : 0);
+        }
+#endif
+
         vk->vkGetImageMemoryRequirements(out->mDevice, out->mImage, &out->mImageMemoryRequirements);
 
+#if defined(__APPLE__)
+        if (vimaGuestProviderTex) {
+            // `mreq.size` is descriptor-derived and independent of the import
+            // (MoltenVK 1.4.2 MVKImage.mm:1294-1310) — the host CB image reports
+            // the same number for the same CB. Compare against the host CB's
+            // `VIMA E0 imgMemReqSize=` for the same CB, not against a smaller image.
+            GFXSTREAM_INFO("VIMA FIX-A\": CB %u imported-image mreq.size=%llu typeBits=0x%x",
+                           importedColorBufferHandle,
+                           (unsigned long long)out->mImageMemoryRequirements.size,
+                           out->mImageMemoryRequirements.memoryTypeBits);
+        }
+#endif
         if (out->mImageMemoryRequirements.size > importedColorBufferMemoryInfo.size) {
             VK_ANB_ERR(
                 "Failed to prepare ANB image: attempted to import memory that is not large enough "

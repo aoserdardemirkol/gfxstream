@@ -343,6 +343,10 @@ class VkEmulation {
         bool glExported = false;
         bool externalMemoryCompatible = false;
 
+        // VIMA fork (R2.3): this ColorBuffer's VkImage is backed by an
+        // embedder-provided MTLTexture / IOSurface, not gfxstream-owned memory.
+        bool vimaMetalImported = false;
+
         VulkanMode vulkanMode = VulkanMode::Default;
     };
 

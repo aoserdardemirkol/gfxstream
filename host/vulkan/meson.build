@@ -34,6 +34,7 @@ files_lib_vulkan_server = files(
   'vk_format_utils.cpp',
   'vk_reconstruction.cpp',
   'vk_utils.cpp',
+  'vima_metal_import.cpp',
   'vulkan_boxed_handles.cpp',
   'vulkan_dispatch.cpp',
   'vulkan_handle_mapping.cpp',

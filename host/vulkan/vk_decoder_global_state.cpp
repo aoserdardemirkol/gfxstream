@@ -60,6 +60,21 @@
 #include "trivial_stream.h"
 #include "vk_android_native_buffer_operations.h"
 #include "vk_common_operations.h"
+
+#if defined(__APPLE__)
+#include <vulkan/vulkan_metal.h>   // VkImportMetalTextureInfoEXT
+extern "C" {
+#include "vima_metal_import.h"
+}
+namespace {
+// VIMA ALLOC/ICREATE ordering probe (R2.3.7-decision-5 §C1 step 5) — one shared
+// monotonic sequence across on_vkAllocateMemory(VkImportColorBufferGOOGLE) and
+// on_vkCreateImage(external color-attachment). If ALLOC(cb) precedes the
+// ICREATE that later binds it on the AHB route, a create-time import hook is
+// implementable and safe; if ICREATE precedes ALLOC, no such hook exists.
+std::atomic<uint32_t> gVimaAllocIcreateSeq{0};
+}  // namespace
+#endif
 #include "vk_decoder_context.h"
 #include "vk_decoder_internal_structs.h"
 #include "vk_decoder_snapshot.h"
@@ -2146,6 +2161,44 @@ class VkDecoderGlobalState::Impl {
         updatedDeviceExtensions.push_back("VK_ANDROID_external_memory_android_hardware_buffer");
 #endif
 
+#if defined(__APPLE__)
+        // VIMA R3.0 (decision-7 D-9) — enable VK_EXT_metal_objects on the GUEST's
+        // device. decision-4 §A2.2 enabled it on VkEmulation's own mDevice, but
+        // AndroidNativeBufferInfo::create runs on the guest device/dispatch, so
+        // vkGetDeviceProcAddr returned NULL there and `vk->vkExportMetalObjectsEXT`
+        // was null on every call (`exportFn=0x0`, 26x/boot). That made the
+        // `VIMA E0-guest same=` oracle -- the structural predicate for "is the
+        // guest's render image OUR MTLTexture?" -- produce ZERO lines, which P8
+        // then read as a pass on absent evidence (D-8).
+        //
+        // This is a diagnostic enable only: the texture import itself is not gated
+        // on it (MVKImage.mm:1310 is unconditional). Without it every R3 experiment
+        // has to infer what it could simply read.
+        {
+            uint32_t devExtCount = 0;
+            vk->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &devExtCount,
+                                                     nullptr);
+            std::vector<VkExtensionProperties> devExts(devExtCount);
+            vk->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &devExtCount,
+                                                     devExts.data());
+            const bool supported = std::any_of(
+                devExts.begin(), devExts.end(), [](const VkExtensionProperties& e) {
+                    return strcmp(e.extensionName, VK_EXT_METAL_OBJECTS_EXTENSION_NAME) == 0;
+                });
+            const bool alreadyOn =
+                std::any_of(updatedDeviceExtensions.begin(), updatedDeviceExtensions.end(),
+                            [](const char* n) {
+                                return strcmp(n, VK_EXT_METAL_OBJECTS_EXTENSION_NAME) == 0;
+                            });
+            if (supported && !alreadyOn) {
+                updatedDeviceExtensions.push_back(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+            }
+            GFXSTREAM_INFO("VIMA GUESTDEV metal_objects supported=%d alreadyOn=%d injected=%d",
+                           supported ? 1 : 0, alreadyOn ? 1 : 0,
+                           (supported && !alreadyOn) ? 1 : 0);
+        }
+#endif
+
         const auto r2features = m_vkEmulation->getRobustness2Features();
         const bool forceEnableRobustness =
             r2features &&
@@ -3165,6 +3218,32 @@ class VkDecoderGlobalState::Impl {
         imageInfo.layout = pCreateInfo->initialLayout;
         imageInfo.anbInfo = std::move(anbInfo);
 
+#if defined(__APPLE__)
+        // VIMA ICREATE (decision-5 §C1 step 5) — log external color-attachment
+        // image creates (the AHB-render-target candidates) with the pNext chain
+        // that `vk_make_orphan_copy` above just dropped, so §B4 defect 2 and the
+        // ALLOC/ICREATE ordering question are both answerable from the log.
+        if ((pCreateInfo->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
+            vk_find_struct<VkExternalMemoryImageCreateInfo>(pCreateInfo) != nullptr &&
+            nativeBufferANDROID == nullptr) {
+            std::string pn;
+            for (auto* p = reinterpret_cast<const VkBaseInStructure*>(pCreateInfo->pNext); p;
+                 p = p->pNext) {
+                if (!pn.empty()) pn += ",";
+                pn += std::to_string(static_cast<int>(p->sType));
+            }
+            // decision-7 §C1 / §D-16 — tiling and flags decide whether the
+            // HostAllocation mechanism (DE8) can reach this image at all:
+            // DE8-EXT shows HOST_ALLOCATION write-through works at tiling=1
+            // (LINEAR) and is silently dishonoured at tiling=0 (OPTIMAL).
+            GFXSTREAM_INFO("VIMA ICREATE seq=%u image=%p %ux%u fmt=%s usage=0x%x flags=0x%x tiling=%d pNextTypes=[%s]",
+                           gVimaAllocIcreateSeq.fetch_add(1), (void*)*pImage,
+                           pCreateInfo->extent.width, pCreateInfo->extent.height,
+                           string_VkFormat(pCreateInfo->format), pCreateInfo->usage,
+                           pCreateInfo->flags, (int)pCreateInfo->tiling, pn.c_str());
+        }
+#endif
+
         if (boxImage) {
             *pImage = new_boxed_non_dispatchable_VkImage(*pImage);
             imageInfo.boxed = *pImage;
@@ -3258,6 +3337,30 @@ class VkDecoderGlobalState::Impl {
         return VK_SUCCESS;
     }
 
+#if defined(__APPLE__)
+    // VIMA ROUTE ahb (R2.3.7-decision-5 §C1 step 1) — FIX-A‴ REVERTED. The
+    // bind-time destroy/recreate of the guest render `VkImage` wedged
+    // SurfaceFlinger at t≈36 s (it mutates an object the guest still owns; the
+    // decoder has no `ImageViewInfo.image` field to refcount live views, and
+    // `imageCreateInfoShallow` is a `vk_make_orphan_copy` that drops the guest
+    // pNext chain — decision-5 §B4). It also touched only ColorBuffers that were
+    // never presented. This helper is now log-only: it records which CBs take the
+    // AHB bind path and whether VIMA already imported them at create (arm 1), so
+    // F-NOROUTE / the per-surface pixelGate stay reviewable. No object mutation.
+    void vimaLogAhbRoute(const VkBindImageMemoryInfo* bimi, uint32_t cb) {
+        const auto cbInfoOpt = m_vkEmulation ? m_vkEmulation->getColorBufferInfo(cb) : std::nullopt;
+        const bool vimaCb = cbInfoOpt && cbInfoOpt->vimaMetalImported;
+        bool isAnb = false;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* ii = gfxstream::base::find(mImageInfo, bimi->image);
+            isAnb = ii && ii->anbInfo != nullptr;
+        }
+        GFXSTREAM_INFO("VIMA ROUTE ahb cb=%u vimaImported=%d arm1Anb=%d image=%p (log-only, FIX-A‴ reverted)",
+                       cb, vimaCb ? 1 : 0, isAnb ? 1 : 0, (void*)bimi->image);
+    }
+#endif
+
     VkResult performBindImageMemory(gfxstream::base::BumpPool* pool,
                                     VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
                                     const VkBindImageMemoryInfo* bimi) EXCLUDES(mMutex) {
@@ -3274,6 +3377,19 @@ class VkDecoderGlobalState::Impl {
         auto vk = dispatch_VkDevice(boxed_device);
 
         VALIDATE_REQUIRED_HANDLE(memory);
+
+#if defined(__APPLE__)
+        {
+            std::optional<uint32_t> cbOpt;
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                auto* mi = gfxstream::base::find(mMemoryInfo, memory);
+                if (mi) cbOpt = mi->boundColorBuffer;
+            }
+            if (cbOpt) vimaLogAhbRoute(bimi, *cbOpt);
+        }
+#endif
+
         VkResult result = vk->vkBindImageMemory(device, image, memory, memoryOffset);
         if (result != VK_SUCCESS) {
             return result;
@@ -3390,6 +3506,19 @@ class VkDecoderGlobalState::Impl {
                 if (!imageInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
                 imageInfo->boundColorBuffer = memoryInfo->boundColorBuffer;
+#if defined(__APPLE__)
+                // VIMA ROUTE ahb (decision-4 §C1) — this direct bindImageMemory2
+                // path does NOT run FIX-A‴ (no rebuild here); a presented CB that
+                // only shows up here is F-NOROUTE and needs a hook added.
+                if (memoryInfo->boundColorBuffer) {
+                    const auto ci = m_vkEmulation
+                        ? m_vkEmulation->getColorBufferInfo(*memoryInfo->boundColorBuffer)
+                        : std::nullopt;
+                    GFXSTREAM_INFO("VIMA ROUTE ahb2 cb=%u vimaImported=%d (direct path, no FIX-A‴)",
+                                   *memoryInfo->boundColorBuffer,
+                                   (ci && ci->vimaMetalImported) ? 1 : 0);
+                }
+#endif
                 if (memoryInfo->boundColorBuffer && deviceInfo->debugUtilsHelper.isEnabled()) {
                     deviceInfo->debugUtilsHelper.addDebugLabel(
                         pBindInfos[i].image, "ColorBuffer:%d", *memoryInfo->boundColorBuffer);
@@ -6345,6 +6474,14 @@ class VkDecoderGlobalState::Impl {
             vk_find_struct<VkImportColorBufferGOOGLE>(pAllocateInfo);
         const VkImportBufferGOOGLE* importBufferInfoPtr =
             vk_find_struct<VkImportBufferGOOGLE>(pAllocateInfo);
+
+#if defined(__APPLE__)
+        // VIMA ALLOC (decision-5 §C1 step 5) — paired with VIMA ICREATE above.
+        if (importCbInfoPtr) {
+            GFXSTREAM_INFO("VIMA ALLOC seq=%u cb=%u", gVimaAllocIcreateSeq.fetch_add(1),
+                           importCbInfoPtr->colorBuffer);
+        }
+#endif
 
         const VkCreateBlobGOOGLE* createBlobInfoPtr =
             vk_find_struct<VkCreateBlobGOOGLE>(pAllocateInfo);
