@@ -30,8 +30,11 @@
 
 #include "vk_decoder.h"
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <optional>
 #include <unordered_map>
 
@@ -61,6 +64,87 @@
 namespace gfxstream {
 namespace host {
 namespace vk {
+
+// VIMA fork (0013): tunables for the process-seqno stall guard in
+// VkDecoder::Impl::decode(). Times are milliseconds; 0 disables that stage.
+//   VIMA_GFXSTREAM_SEQNO_WARN_MS      log once when the counter has been frozen this long
+//   VIMA_GFXSTREAM_SEQNO_DEADLINE_MS  give up and force the counter forward
+// Both are on by default. Besides breaking the deadlock, this patch replaces
+// upstream's busy spin with a sleeping backoff, so a stalled stream no longer
+// pins a core at 100%.
+namespace {
+
+uint64_t vimaEnvMs(const char* key, uint64_t defaultMs) {
+    const std::string raw = gfxstream::base::getEnvironmentVariable(key);
+    if (raw.empty()) return defaultMs;
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(raw.c_str(), &end, 10);
+    if (errno != 0 || end == raw.c_str() || *end != '\0') {
+        GFXSTREAM_WARNING("Ignoring malformed %s=\"%s\"; using %llu ms.", key, raw.c_str(),
+                          (unsigned long long)defaultMs);
+        return defaultMs;
+    }
+    return parsed;
+}
+
+uint64_t vimaSeqnoWarnUs() {
+    static const uint64_t kUs = vimaEnvMs("VIMA_GFXSTREAM_SEQNO_WARN_MS", 1000) * 1000;
+    return kUs;
+}
+
+// Deadline after which a frozen counter is forced past a seqno whose packet has
+// not been written yet.
+//
+// The guest-side cause is now pinned exactly, in vulkan.ranchu.so
+// (build-id 98da3ce8b78dee24589c599e03d340a0), and it is a three-way deadlock:
+//
+//   1. VkEncoder::vkDestroyFence reserves stream space, allocates its seqno
+//      (nextSeqno at +0xd0) and stamps it into the packet (+0xf0) -- and only
+//      *then* calls destroyMapping()->mapHandles_VkFence (+0x13c), which takes
+//      ResourceTracker's recursive mLock. The stream flush is the instruction
+//      after that call (+0x140). So a thread blocked on mLock is holding a
+//      live seqno whose packet is still sitting in its own stream buffer.
+//   2. ResourceTracker::on_vkQueueSubmitTemplate takes that same mLock and
+//      keeps it held across VkEncoder::vkQueueWaitIdle, which blocks waiting
+//      for a host reply.
+//   3. The host cannot produce that reply, because the seqno immediately
+//      before it is the one stuck in step 1.
+//
+// ANGLE's CleanUpThread destroys fences concurrently with presents, so this
+// needs no misbehaviour by the app -- just the wrong interleaving, seen about
+// once an hour under sustained scrolling. It is why the gap is always exactly
+// 2 and why the blocked packet is always OP_vkQueueWaitIdle preceded by
+// OP_vkQueueSubmitAsync2GOOGLE.
+//
+// Nothing is lost by forcing. The stuck packet has not been dropped, only
+// delayed: once this thread stops waiting, step 2 completes, mLock is
+// released, and vkDestroyFence flushes its packet as normal. It arrives with a
+// seqno the counter has already passed, and the signed compare above lets it
+// decode immediately instead of hanging. Out-of-order is safe for this one
+// packet -- the guest had already committed to destroying that fence, so no
+// later command refers to it.
+//
+// 2s is deliberately far above any real command. Untreated the stall is
+// permanent (measured at 7+ minutes, guest RenderThread asleep in
+// ensureType1Finished waiting for a reply the host can never send), so
+// anything still frozen at 2s is deadlocked, not slow. Cost of not recovering:
+// the app ANRs. Set VIMA_GFXSTREAM_SEQNO_DEADLINE_MS=0 to go back to waiting.
+uint64_t vimaSeqnoDeadlineUs() {
+    static const uint64_t kUs = vimaEnvMs("VIMA_GFXSTREAM_SEQNO_DEADLINE_MS", 2000) * 1000;
+    return kUs;
+}
+
+// Iterations of the original pause/yield spin before we start reading the clock.
+// The common case (waiting a few microseconds for the thread ahead of us) never
+// gets past this, so the fast path keeps upstream's behaviour and cost.
+constexpr uint32_t kVimaSeqnoFastSpinIters = 1024;
+
+// Poll interval once we are past the fast path. Slow enough to stop pinning a
+// core, fast enough that recovery latency is dominated by the deadline.
+constexpr uint64_t kVimaSeqnoBackoffUs = 100;
+
+}  // namespace
 
 class VkDecoder::Impl {
    public:
@@ -95,6 +179,9 @@ class VkDecoder::Impl {
     BoxedHandleUnwrapMapping m_boxedHandleUnwrapMapping;
     gfxstream::base::BumpPool m_pool;
     std::optional<uint32_t> m_prevSeqno;
+    // VIMA fork (0013): opcode that went with m_prevSeqno, so a stall can name
+    // the last call this thread decoded before the gap opened.
+    uint32_t m_prevOpcode = 0;
     bool m_queueSubmitWithCommandsEnabled = false;
     const bool m_snapshotsEnabled = false;
 };
@@ -165,7 +252,49 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
             }
             if (seqnoPtr && !m_forSnapshotLoad) {
                 {
-                    while ((seqno - seqnoPtr->load(std::memory_order_seq_cst) != 1)) {
+                    // VIMA fork (0013): upstream spins here forever. Every Vulkan
+                    // packet from one guest process must be decoded in strict seqno
+                    // order across all of that process's RenderThreads, so if the
+                    // counter ever stops advancing -- a packet that never arrived, or
+                    // a ProcessResources recreated for the same puid (mSequenceNumber
+                    // back to 0) under a guest that keeps counting up -- then every
+                    // later command from that process queues behind this loop
+                    // permanently. The guest's vkQueueWaitIdle never returns, its
+                    // RenderThread hangs, the app ANRs, and one host core spins at
+                    // 100%. Observed with Instagram on R2.
+                    //
+                    // Three stages: keep upstream's pause/yield spin for the first
+                    // kVimaSeqnoFastSpinIters (the only path a healthy stream takes),
+                    // then back off to a sleep so a stall stops burning a core, then
+                    // give up -- report the gap and force the counter forward so the
+                    // stream resumes. Skipping one command costs a frame; spinning
+                    // costs the app.
+                    //
+                    // The deadline only runs while the counter is *frozen*. If `have`
+                    // is still moving we are merely queued behind a slow command (a
+                    // first-use pipeline compile can legitimately take seconds), so
+                    // the clock restarts and we keep waiting.
+                    uint32_t iters = 0;
+                    uint64_t stallStartUs = 0;
+                    uint32_t lastHave = 0;
+                    bool haveValid = false;
+                    bool warned = false;
+
+                    for (;;) {
+                        const uint32_t have = seqnoPtr->load(std::memory_order_seq_cst);
+                        // VIMA fork (0013): upstream tests `seqno - have == 1`,
+                        // which is only satisfiable while the counter is *behind*
+                        // us. The moment anything moves it past our predecessor the
+                        // subtraction underflows to a huge positive and this thread
+                        // waits forever. That is what made the earlier deadline
+                        // recovery worse than no recovery: forcing the counter past
+                        // a merely-late packet left the thread that finally produced
+                        // it permanently unsatisfiable, and every packet after that
+                        // burned the whole deadline. Signed compare means "my
+                        // predecessor has been decoded, or someone already moved the
+                        // counter past it" -- both mean it is our turn.
+                        if ((int32_t)(seqno - have) <= 1) break;
+
                         if (shouldExit.load(std::memory_order_relaxed)) {
                             GFXSTREAM_WARNING(
                                 "Process=%s is exitting. Skip processing seqno=%d on thread=0x%x.",
@@ -173,19 +302,83 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                                 gfxstream::base::getCurrentThreadId());
                             return 0;
                         }
+
+                        if (++iters < kVimaSeqnoFastSpinIters) {
 #if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
-                        _mm_pause();
+                            _mm_pause();
 #elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
-                        __asm__ __volatile__("pause;");
+                            __asm__ __volatile__("pause;");
 #elif (defined(__GNUC__) && (defined(__aarch64__) || defined(__arm__)))
-                        // VIMA fork (0005): upstream leaves this spin body empty
-                        // on ARM, so a stalled process seqno pins a core at 100%
-                        // (seen on Apple Silicon: ~1 full core per wedged
-                        // RenderThread). yield is the ARM spin-wait hint.
-                        __asm__ __volatile__("yield" ::: "memory");
+                            // VIMA fork (0005): upstream leaves this spin body empty
+                            // on ARM. yield is the ARM spin-wait hint.
+                            __asm__ __volatile__("yield" ::: "memory");
 #endif
+                            continue;
+                        }
+
+                        const uint64_t nowUs = gfxstream::base::getUnixTimeUs();
+                        if (!haveValid || have != lastHave) {
+                            haveValid = true;
+                            lastHave = have;
+                            stallStartUs = nowUs;
+                            warned = false;
+                        } else {
+                            const uint64_t stalledUs = nowUs - stallStartUs;
+                            const uint64_t warnUs = vimaSeqnoWarnUs();
+                            const uint64_t deadlineUs = vimaSeqnoDeadlineUs();
+
+                            if (!warned && warnUs != 0 && stalledUs >= warnUs) {
+                                warned = true;
+                                GFXSTREAM_ERROR(
+                                    "VIMA-0013 seqno stall: puid=%llu process=%s want=%u have=%u "
+                                    "gap=%u frozen %llums on thread=0x%x. Blocked packet is %s. "
+                                    "This thread last decoded seqno=%d (%s). Every later Vulkan "
+                                    "command from this process is blocked behind it.",
+                                    (unsigned long long)context.puid,
+                                    processName ? processName : "null", seqno, have,
+                                    (unsigned)(seqno - have),
+                                    (unsigned long long)(stalledUs / 1000),
+                                    gfxstream::base::getCurrentThreadId(),
+                                    api_opcode_to_string(opcode),
+                                    m_prevSeqno ? (int)m_prevSeqno.value() : -1,
+                                    m_prevSeqno ? api_opcode_to_string(m_prevOpcode) : "none");
+                            }
+
+                            if (deadlineUs != 0 && stalledUs >= deadlineUs) {
+                                // Only ever advance. have can legitimately be *past* our
+                                // predecessor (two contexts of one puid have been seen
+                                // issuing overlapping seqnos, which makes seqno - have
+                                // underflow and the wait unsatisfiable). Storing seqno - 1
+                                // blindly would rewind the counter and starve the thread
+                                // that already moved it, which cascades into a stall loop.
+                                const uint32_t target = seqno - 1;
+                                const bool advances = (int32_t)(target - have) > 0;
+                                GFXSTREAM_ERROR(
+                                    "VIMA-0013 seqno deadlock broken after %llums: puid=%llu "
+                                    "process=%s want=%u have=%u thread=0x%x. %s. The held-back "
+                                    "packet is most likely vkDestroyFence, whose encoder blocks "
+                                    "on ResourceTracker::mLock after taking its seqno but before "
+                                    "flushing; it will arrive late and decode out of order, which "
+                                    "is safe. Raise VIMA_GFXSTREAM_SEQNO_DEADLINE_MS (0 disables) "
+                                    "to keep waiting instead.",
+                                    (unsigned long long)(stalledUs / 1000),
+                                    (unsigned long long)context.puid,
+                                    processName ? processName : "null", seqno, have,
+                                    gfxstream::base::getCurrentThreadId(),
+                                    advances ? "Forcing the counter past the missing seqno"
+                                             : "Counter is already past us; proceeding without "
+                                               "touching it");
+                                if (advances) {
+                                    seqnoPtr->store(target, std::memory_order_seq_cst);
+                                }
+                                break;
+                            }
+                        }
+
+                        gfxstream::base::sleepUs(kVimaSeqnoBackoffUs);
                     }
                     m_prevSeqno = seqno;
+                    m_prevOpcode = opcode;
                 }
             }
         }

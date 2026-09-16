@@ -448,6 +448,8 @@ intptr_t RenderThread::main() {
                     .processName = contextName,
                     .gfxApiLogger = &gfxLogger,
                     .shouldExit = &mDecodersShouldStop,
+                    // VIMA fork (0013): name the process in seqno-stall diagnostics.
+                    .puid = tInfo->m_puid,
                 };
                 last = tInfo->m_vkInfo->m_vkDec.decode(readBuf.buf(), readBuf.validData(), ioStream,
                                                       processResources, context);

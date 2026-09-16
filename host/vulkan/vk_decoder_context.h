@@ -16,6 +16,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 #include "gfxstream/host/GfxApiLogger.h"
@@ -28,6 +29,10 @@ struct VkDecoderContext {
     const char* processName = nullptr;
     host::GfxApiLogger* gfxApiLogger = nullptr;
     std::atomic_bool* shouldExit = nullptr;
+    // VIMA fork (0013): the guest process this stream belongs to. Only used for
+    // diagnostics -- a seqno stall is per-process, and processName alone is not
+    // enough to tell two contexts of the same app apart.
+    uint64_t puid = 0;
 };
 
 }  // namespace vk
