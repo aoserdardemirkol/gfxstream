@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "gfxstream/host/address_space_graphics.h"
+#include "gfxstream/system/System.h"
 
 #include <memory>
 #include <optional>
@@ -626,8 +627,52 @@ AsgOnUnavailableReadStatus AddressSpaceGraphicsContext::onUnavailableRead() {
     // ring re-check in RingStream::readRaw before it calls this; this 1 s poll
     // is only a backstop and should never fire in practice, so its cost is
     // negligible (one wakeup per second per idle context).
-    const auto maybeCmd = mConsumerMessages.timedReceive(1000000 /* us */);
+    // VIMA fork (0006): an ABSOLUTE deadline, not a relative duration.
+    //
+    // ConditionVariable::timedWait takes `waitUntilUs` — microseconds since the
+    // epoch — and both implementations treat it that way: POSIX builds a
+    // timespec from it directly, Windows clamps `waitUntilUs - now` to 0 when it
+    // is in the past. Patch 0005 passed a bare 1000000 meaning "one second",
+    // which as an absolute time is 12 January 1970, so pthread_cond_timedwait
+    // returned ETIMEDOUT IMMEDIATELY and the "1 s backstop" never waited at all.
+    //
+    // Every idle ASG context therefore span at 100% of a core in
+    // RingStream::readRaw -> onUnavailableRead -> return -> read again.
+    // Measured: 559% CPU on an 8-core host with the guest 392% idle and the VM
+    // service at 9%, loadavg 33. It also starved ProcessCleanupThread, which is
+    // why ~7 GB of ColorBuffers were never reclaimed — one bug, both symptoms.
+    //
+    // This is the only caller in the tree that passed a relative value;
+    // buffer_queue.h and vk_decoder_global_state.cpp both pass real deadlines.
+    const auto maybeCmd =
+        mConsumerMessages.timedReceive(gfxstream::base::getUnixTimeUs() + 1000000);
     if (!maybeCmd) {
+        // VIMA fork (0006): an EMPTY result means one of two very different
+        // things, and treating them alike burns a core per dead context.
+        //
+        // MessageChannelBase::beforeTimedRead only waits while
+        // (mCount == 0 && !mStopped). Once the channel is STOPPED it skips the
+        // wait entirely and timedReceive returns empty IMMEDIATELY -- not after
+        // the 1 s above. Returning kContinue then sets host_state=CAN_CONSUME,
+        // RingStream::readRaw loops, finds the ring still empty, and calls back
+        // in here at once: a tight spin at 100% of a core, forever, for every
+        // context whose channel has been stopped.
+        //
+        // That is what tearing down a guest process does, so a game that
+        // creates many ASG contexts leaves many spinning threads behind.
+        // Measured before this fix: 559% CPU on an 8-core host with the guest
+        // 392% IDLE and the VM service at 9%, loadavg 33, with the hot stacks
+        // in ProcessCleanupThread::CleanProcessResources and
+        // AsgOnUnavailableReadStatus. The same spin is why cleanup never
+        // completed and ~7 GB of ColorBuffers were never freed -- one bug, both
+        // symptoms.
+        //
+        // A stopped channel means this context is going away, so the consumer
+        // should EXIT rather than keep asking. Only a genuine 1 s timeout is
+        // the harmless backstop that patch 0005 intended.
+        if (mConsumerMessages.isStopped()) {
+            return AsgOnUnavailableReadStatus::kExit;
+        }
         return AsgOnUnavailableReadStatus::kContinue;
     }
     cmd = *maybeCmd;
