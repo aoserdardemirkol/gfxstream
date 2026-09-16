@@ -114,7 +114,8 @@ int RingStream::commitBuffer(size_t size) {
 
         // Check if the guest process crashed.
         if (!avail) {
-            if (*(mContext.host_state) == ASG_HOST_STATE_EXIT) {
+            if (__atomic_load_n(mContext.host_state, __ATOMIC_SEQ_CST) ==
+                ASG_HOST_STATE_EXIT) {
                 return sent;
             } else {
                 ring_buffer_yield();
@@ -158,7 +159,34 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
     uint32_t spins = 0;
     bool inLargeXfer = true;
 
-    *(mContext.host_state) = ASG_HOST_STATE_CAN_CONSUME;
+    // VIMA fork (0009): EVERY host_state access is seq-cst, not just the
+    // NEED_NOTIFY publish that patch 0005 fixed.
+    //
+    // host_state lives in memory shared with the guest across Apple's
+    // Virtualization framework (patch 0002), on weakly-ordered ARM64. 0005
+    // correctly made the NEED_NOTIFY publish a seq-cst store with a fence and a
+    // ring re-check, but left the CAN_CONSUME, RENDERING and EXIT transitions as
+    // plain stores, and the EXIT check as a plain load. Those are the same
+    // hazard on the other transitions: the compiler may sink or reorder them,
+    // and the guest may observe them late or not at all.
+    //
+    // The consequence is a hard hang, and it is not theoretical -- it is what
+    // Where Winds Meet does once it reaches gameplay (R5.88):
+    //
+    //   guest  vkQueueWaitIdle -> speculativeRead -> usleep   (awaiting a reply)
+    //   host   RingStream::readRaw -> onUnavailableRead       (awaiting data)
+    //
+    // Both sides waiting on the other, no errors on either. A guest that reads a
+    // stale CAN_CONSUME believes this consumer is actively polling and skips its
+    // ASG_NOTIFY_AVAILABLE ping; the consumer then parks with the guest's data
+    // already in the ring. Patch 0006's one-second backstop is supposed to
+    // recover exactly that by re-reading the ring, and it does not here, which
+    // points at visibility rather than at the wakeup.
+    //
+    // Making every transition seq-cst costs nothing measurable -- these are a
+    // handful of stores per read, against ring traffic of megabytes -- and
+    // removes the whole class.
+    __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME, __ATOMIC_SEQ_CST);
 
     while (count < wanted) {
 
@@ -179,7 +207,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
             break;
         }
 
-        *(mContext.host_state) = ASG_HOST_STATE_CAN_CONSUME;
+        __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME, __ATOMIC_SEQ_CST);
 
         if (mShouldExit) {
             return nullptr;
@@ -278,11 +306,14 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
                     const AsgOnUnavailableReadStatus status = mCallbacks.onUnavailableRead();
                     switch (status) {
                         case AsgOnUnavailableReadStatus::kContinue: {
-                            *(mContext.host_state) = ASG_HOST_STATE_CAN_CONSUME;
+                            __atomic_store_n(mContext.host_state,
+                                             ASG_HOST_STATE_CAN_CONSUME,
+                                             __ATOMIC_SEQ_CST);
                             break;
                         }
                         case AsgOnUnavailableReadStatus::kExit: {
-                            *(mContext.host_state) = ASG_HOST_STATE_EXIT;
+                            __atomic_store_n(mContext.host_state, ASG_HOST_STATE_EXIT,
+                                             __ATOMIC_SEQ_CST);
                             mShouldExit = true;
                             break;
                         }
@@ -309,7 +340,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
     ++mXmits;
     mTotalRecv += count;
 
-    *(mContext.host_state) = ASG_HOST_STATE_RENDERING;
+    __atomic_store_n(mContext.host_state, ASG_HOST_STATE_RENDERING, __ATOMIC_SEQ_CST);
     return (const unsigned char*)buf;
 }
 
