@@ -4244,6 +4244,22 @@ bool VkEmulation::updateColorBufferFromBytesLocked(uint32_t colorBufferHandle, u
                         colorBufferHandle);
         return false;
     }
+    // Raw virtio YV12/YV21 uploads use 32-pixel-aligned luma rows and
+    // half-stride chroma rows (GetTransferSize). Internal byte vectors use
+    // the tightly packed Vulkan layout and must retain the default copies.
+    if (inputPixelsSize == 0 &&
+        (colorBufferInfo->format == GfxstreamFormat::YV12 ||
+         colorBufferInfo->format == GfxstreamFormat::YV21)) {
+        const uint32_t yStride = (w + 31u) & ~31u;
+        VkDeviceSize offset = 0;
+        for (auto& copy : transferInfo.bufferImageCopies) {
+            const bool luma = copy.imageSubresource.aspectMask == VK_IMAGE_ASPECT_PLANE_0_BIT;
+            copy.bufferOffset = offset;
+            copy.bufferRowLength = luma ? yStride : yStride / 2;
+            offset += VkDeviceSize(copy.bufferRowLength) * (luma ? h : h / 2);
+        }
+        transferInfo.stagingBufferCopySize = offset;
+    }
     VkDeviceSize dstBufferSize = transferInfo.stagingBufferCopySize;
     const std::vector<VkBufferImageCopy>& bufferImageCopies = transferInfo.bufferImageCopies;
 
