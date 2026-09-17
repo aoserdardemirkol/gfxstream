@@ -56,6 +56,7 @@ endif
 
 
 if host_machine.system() == 'darwin'
+  files_lib_vulkan_server += files('vima_metal_heap_alias.mm')
   vulkan_server_cpp_args += '-DVK_USE_PLATFORM_METAL_EXT'
   vulkan_server_cpp_args += '-DVK_USE_PLATFORM_MACOS_MVK'
 elif host_machine.system() == 'windows'

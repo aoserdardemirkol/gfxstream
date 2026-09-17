@@ -156,7 +156,7 @@ if host_machine.system() == 'linux'
 elif host_machine.system() == 'darwin'
   deps_gfxstream_backend += [
     thread_dep,
-    dependency('appleframeworks', modules: ['AppKit', 'QuartzCore', 'IOSurface']),
+    dependency('appleframeworks', modules: ['AppKit', 'QuartzCore', 'IOSurface', 'Metal']),
   ]
   link_args_gfxstream_backend = ['-undefined', 'dynamic_lookup', '-flat_namespace']
 elif host_machine.system() == 'qnx'

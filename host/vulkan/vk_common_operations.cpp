@@ -53,6 +53,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <vulkan/vulkan_beta.h>  // for MoltenVK portability extensions
 #include <vulkan/vulkan_metal.h>
+#include "vima_metal_heap_alias.h"
 #include "vima_metal_import.h"
 #endif
 
@@ -3296,9 +3297,16 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
                 sink(colorBufferHandle, tex, infoPtr->width, infoPtr->height,
                      static_cast<int>(vkFormat));
             }
+        } else if (void* alias = vimaNewHeapAliasTexture(infoPtr->memory.externalMetalHandle,
+                                                         infoPtr->imageCreateInfoShallow,
+                                                         infoPtr->memory.bindOffset)) {
+            // KosmicKrisp: no vkExportMetalObjectsEXT; alias the image on its exported heap.
+            sink(colorBufferHandle, alias, infoPtr->width, infoPtr->height,
+                 static_cast<int>(vkFormat));
+            vimaReleaseHeapAliasTexture(alias);
         } else {
-            GFXSTREAM_ERROR("ColorBuffer %u: vkExportMetalObjectsEXT unavailable",
-                            colorBufferHandle);
+            GFXSTREAM_ERROR("ColorBuffer %u: no MTLTexture (no vkExportMetalObjectsEXT, format %s)",
+                            colorBufferHandle, string_VkFormat(vkFormat));
         }
     }
 #endif
