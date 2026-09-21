@@ -7335,12 +7335,27 @@ class VkDecoderGlobalState::Impl {
         return VK_SUCCESS;
     }
 
+    void acquireScanoutImage(VkImage image) {
+        std::shared_ptr<VimaScanoutSync> sync;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* info = gfxstream::base::find(mImageInfo, image);
+            if (info && info->anbInfo && info->anbInfo->isUsingNativeImage()) {
+                sync = m_vkEmulation->scanoutSync(info->anbInfo->getColorBufferHandle());
+            }
+        }
+        // Never wait with the decoder's global mutex held: another producer's
+        // release completion may need it before publishing readiness.
+        if (sync) sync->acquireGuest();
+    }
+
     VkResult on_vkAcquireImageANDROID(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
                                       VkDevice boxed_device, VkImage image, int nativeFenceFd,
                                       VkSemaphore semaphore, VkFence fence) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
 
+        acquireScanoutImage(image);
         std::lock_guard<std::mutex> lock(mMutex);
 
         auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
@@ -7410,6 +7425,7 @@ class VkDecoderGlobalState::Impl {
         auto queue = unbox_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
 
+        acquireScanoutImage(image);
         std::lock_guard<std::mutex> lock(mMutex);
 
         auto* queueInfo = gfxstream::base::find(mQueueInfo, queue);
@@ -7802,6 +7818,19 @@ class VkDecoderGlobalState::Impl {
         CommandBufferInfo& cmdBuffer = mCommandBufferInfo[commandBuffer];
         cmdBuffer.subCmds.insert(cmdBuffer.subCmds.end(), pCommandBuffers,
                                  pCommandBuffers + commandBufferCount);
+        if (m_vkEmulation->vimaExternalPresentation) {
+            for (uint32_t i = 0; i < commandBufferCount; ++i) {
+                auto* secondary = gfxstream::base::find(mCommandBufferInfo, pCommandBuffers[i]);
+                if (!secondary) continue;
+                cmdBuffer.acquiredColorBuffers.insert(secondary->acquiredColorBuffers.begin(),
+                                                     secondary->acquiredColorBuffers.end());
+                cmdBuffer.releasedColorBuffers.insert(secondary->releasedColorBuffers.begin(),
+                                                     secondary->releasedColorBuffers.end());
+                cmdBuffer.allDescriptorSets.insert(secondary->allDescriptorSets.begin(),
+                                                  secondary->allDescriptorSets.end());
+                for (const auto& [cb, layout] : secondary->cbLayouts) cmdBuffer.cbLayouts[cb] = layout;
+            }
+        }
     }
 
     // Check if all wait semaphores can be signalled
@@ -8021,6 +8050,8 @@ class VkDecoderGlobalState::Impl {
 
         std::unordered_set<HandleType> acquiredColorBuffers;
         std::unordered_set<HandleType> releasedColorBuffers;
+        std::unordered_map<HandleType, VkImageLayout> scanoutLayouts;
+        std::unordered_map<HandleType, std::shared_ptr<VimaScanoutSync>> scanoutUses;
         VkDevice device = VK_NULL_HANDLE;
         std::mutex* queueMutex = nullptr;
         PhysicalQueuePendingOps* pendingOps = nullptr;
@@ -8030,7 +8061,8 @@ class VkDecoderGlobalState::Impl {
         {
             std::lock_guard<std::mutex> lock(mMutex);
 
-            if (!m_vkEmulation->getFeatures().GuestVulkanOnly.enabled()) {
+            if (!m_vkEmulation->getFeatures().GuestVulkanOnly.enabled() ||
+                m_vkEmulation->vimaExternalPresentation) {
                 for (uint32_t i = 0; i < submitCount; i++) {
                     for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
                         VkCommandBuffer cmdBuffer = getCommandBuffer(pSubmits[i], j);
@@ -8058,10 +8090,16 @@ class VkDecoderGlobalState::Impl {
                             }
                         }
 
-                        acquiredColorBuffers.merge(cmdBufferInfo->acquiredColorBuffers);
-                        releasedColorBuffers.merge(cmdBufferInfo->releasedColorBuffers);
+                        acquiredColorBuffers.insert(cmdBufferInfo->acquiredColorBuffers.begin(),
+                                                    cmdBufferInfo->acquiredColorBuffers.end());
+                        releasedColorBuffers.insert(cmdBufferInfo->releasedColorBuffers.begin(),
+                                                    cmdBufferInfo->releasedColorBuffers.end());
                         for (const auto& ite : cmdBufferInfo->cbLayouts) {
-                            m_vkEmulation->setColorBufferCurrentLayout(ite.first, ite.second);
+                            if (m_vkEmulation->vimaExternalPresentation) {
+                                scanoutLayouts[ite.first] = ite.second;
+                            } else {
+                                m_vkEmulation->setColorBufferCurrentLayout(ite.first, ite.second);
+                            }
                         }
                     }
                 }
@@ -8102,6 +8140,27 @@ class VkDecoderGlobalState::Impl {
                     mRenderDocWithMultipleVkInstances->onFrameDelimiter(phyDeviceInfo->instance);
                 }
             }
+        }
+
+        if (m_vkEmulation->vimaExternalPresentation) {
+            auto addUse = [&](HandleType cb) {
+                auto sync = m_vkEmulation->scanoutSync(cb);
+                if (sync) scanoutUses.emplace(cb, std::move(sync));
+            };
+            for (auto cb : acquiredColorBuffers) addUse(cb);
+            for (auto cb : releasedColorBuffers) addUse(cb);
+            for (const auto& [cb, layout] : scanoutLayouts) addUse(cb);
+            // Outside decoder/queue locks. Display completion never needs a
+            // guest submission, so reacquisition cannot deadlock that worker.
+            for (auto& [cb, sync] : scanoutUses) sync->acquireGuest();
+            for (const auto& [cb, layout] : scanoutLayouts) {
+                m_vkEmulation->setColorBufferCurrentLayout(cb, layout);
+            }
+        }
+        std::unordered_map<HandleType, uint64_t> scanoutGenerations;
+        for (auto cb : releasedColorBuffers) {
+            const auto use = scanoutUses.find(cb);
+            if (use != scanoutUses.end()) scanoutGenerations[cb] = use->second->releaseGuest();
         }
 
         for (HandleType cb : acquiredColorBuffers) {
@@ -8158,6 +8217,9 @@ class VkDecoderGlobalState::Impl {
                 if (result != VK_SUCCESS) {
                     GFXSTREAM_WARNING("dispatchVkQueueSubmit failed: %s [%d]", string_VkResult(result),
                                     result);
+                    for (auto [cb, generation] : scanoutGenerations) {
+                        scanoutUses.at(cb)->producerFailed(generation);
+                    }
                     return result;
                 }
             } else {
@@ -8270,15 +8332,25 @@ class VkDecoderGlobalState::Impl {
                     // This may cause presentation issues, but no need to return a failure
                     GFXSTREAM_ERROR("Cannot sync colorbuffers, vkWaitForFences failed: %s [%d]",
                                     string_VkResult(result), result);
+                    for (auto [cb, generation] : scanoutGenerations) {
+                        scanoutUses.at(cb)->producerFailed(generation);
+                    }
                 } else {
                     for (HandleType cb : releasedColorBuffers) {
                         m_vkEmulation->getGlobalState()->flushColorBuffer(cb);
+                        const auto use = scanoutUses.find(cb);
+                        if (use != scanoutUses.end()) {
+                            use->second->producerCompleted(scanoutGenerations.at(cb));
+                        }
                     }
                 }
             } else {
                 GFXSTREAM_ERROR(
                     "Waiting timeline semaphores on presentation images is not supported when "
                     "the virtual queue is active.");
+                for (auto [cb, generation] : scanoutGenerations) {
+                    scanoutUses.at(cb)->producerFailed(generation);
+                }
             }
         }
 

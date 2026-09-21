@@ -268,15 +268,17 @@ DisplayVk::PostResult DisplayVk::postImpl(const Post& postCmd) {
     // We need to unconditionally acquire and release the image to satisfy the requiremment for the
     // borrowed image.
     struct ImageBorrower {
-        ImageBorrower(const VulkanDispatch& vk, VkQueue queue,
+        ImageBorrower(const VulkanDispatch& vk, VkDevice device, VkQueue queue,
                       std::shared_ptr<gfxstream::base::Lock> queueLock,
                       uint32_t usedQueueFamilyIndex, const ColorBufferVkImageInfo& image,
                       const ImageBorrowResource& acquireResource,
-                      const ImageBorrowResource& releaseResource, VkImageLayout layout)
+                      const ImageBorrowResource& releaseResource, VkImageLayout layout,
+                      bool waitForRelease)
             : m_vk(vk),
               m_vkQueue(queue),
               m_queueLock(queueLock),
-              m_releaseResource(releaseResource) {
+              m_releaseResource(releaseResource), m_waitForRelease(waitForRelease),
+              m_vkDeviceForRelease(device) {
             std::vector<VkImageMemoryBarrier> acquireQueueTransferBarriers;
             std::vector<VkImageMemoryBarrier> acquireLayoutTransitionBarriers;
             std::vector<VkImageMemoryBarrier> releaseLayoutTransitionBarriers;
@@ -377,6 +379,8 @@ DisplayVk::PostResult DisplayVk::postImpl(const Post& postCmd) {
         const VkQueue m_vkQueue;
         std::shared_ptr<gfxstream::base::Lock> m_queueLock;
         const ImageBorrowResource& m_releaseResource;
+        const bool m_waitForRelease;
+        const VkDevice m_vkDeviceForRelease;
         ~ImageBorrower() {
             VkSubmitInfo submitInfo = {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -393,6 +397,12 @@ DisplayVk::PostResult DisplayVk::postImpl(const Post& postCmd) {
                 gfxstream::base::AutoLock lock(*m_queueLock);
                 VK_CHECK(m_vk.vkQueueSubmit(m_vkQueue, 1, &submitInfo,
                                             m_releaseResource.m_completeFence));
+            }
+            // The embedder's guest-acquire gate may open only after the
+            // ownership/layout release has finished, not just the final blit.
+            if (m_waitForRelease) {
+                VK_CHECK(m_vk.vkWaitForFences(m_vkDeviceForRelease, 1,
+                    &m_releaseResource.m_completeFence, VK_TRUE, UINT64_MAX));
             }
         }
     };
@@ -427,9 +437,9 @@ DisplayVk::PostResult DisplayVk::postImpl(const Post& postCmd) {
                                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         borrowers.emplace_back(std::make_unique<ImageBorrower>(
-            m_vk, m_compositorVkQueue, m_compositorVkQueueLock, m_compositorQueueFamilyIndex,
+            m_vk, m_vkDevice, m_compositorVkQueue, m_compositorVkQueueLock, m_compositorQueueFamilyIndex,
             *sourceImageInfoVk, *imageBorrowResources[2 * i], *imageBorrowResources[2 * i + 1],
-            layout));
+            layout, postCmd.waitForSourceRelease));
     }
 
     for (auto& postResourceFutureOpt : m_postResourceFutures) {

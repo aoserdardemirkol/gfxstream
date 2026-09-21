@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <vector>
+#include "vima_scanout_sync.h"
 
 #include "gfxstream/host/external_object_manager.h"
 #include "gfxstream/host/gfxstream_format.h"
@@ -75,6 +76,7 @@ class ColorBufferVk {
 
     std::unique_ptr<ColorBufferVkImageInfo> prepareForComposition(bool colorBufferIsTarget);
     std::unique_ptr<ColorBufferVkImageInfo> prepareForDisplay();
+    std::shared_ptr<VimaScanoutSync> scanoutSync();
 
     void onLoad(gfxstream::Stream* stream, LoadImageBehavior behavior);
     void onSave(gfxstream::Stream* stream, SaveImageBehavior behavior);

@@ -60,6 +60,7 @@ class DisplayVk : public Display {
     };
 
     struct Post {
+        bool waitForSourceRelease = false;
         uint32_t frameWidth = 0;
         uint32_t frameHeight = 0;
         std::vector<PostLayer> layers;

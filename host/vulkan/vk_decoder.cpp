@@ -125,13 +125,14 @@ uint64_t vimaSeqnoWarnUs() {
 // packet -- the guest had already committed to destroying that fence, so no
 // later command refers to it.
 //
-// 2s is deliberately far above any real command. Untreated the stall is
+// 500ms is long enough for a normal fence cleanup but keeps a deadlock from
+// freezing the guest UI for seconds. Untreated the stall is
 // permanent (measured at 7+ minutes, guest RenderThread asleep in
 // ensureType1Finished waiting for a reply the host can never send), so
 // anything still frozen at 2s is deadlocked, not slow. Cost of not recovering:
 // the app ANRs. Set VIMA_GFXSTREAM_SEQNO_DEADLINE_MS=0 to go back to waiting.
 uint64_t vimaSeqnoDeadlineUs() {
-    static const uint64_t kUs = vimaEnvMs("VIMA_GFXSTREAM_SEQNO_DEADLINE_MS", 2000) * 1000;
+    static const uint64_t kUs = vimaEnvMs("VIMA_GFXSTREAM_SEQNO_DEADLINE_MS", 500) * 1000;
     return kUs;
 }
 
@@ -211,6 +212,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
     if (len < 8) return 0;
     unsigned char* ptr = (unsigned char*)buf;
     const unsigned char* const end = (const unsigned char*)buf + len;
+    // A recovered queue-wait packet must not re-enter the host wait that
+    // caused the cross-thread seqno deadlock.  The guest treats this call as
+    // a synchronization point; reporting success lets it continue while the
+    // delayed fence-destroy packet is flushed by its owning thread.
+    bool skipRecoveredQueueWaitIdle = false;
     while (end - ptr >= 8) {
         const uint8_t* packet = (const uint8_t*)ptr;
         uint32_t opcode;
@@ -370,6 +376,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                                                "touching it");
                                 if (advances) {
                                     seqnoPtr->store(target, std::memory_order_seq_cst);
+                                    if (opcode == OP_vkQueueWaitIdle) {
+                                        skipRecoveredQueueWaitIdle = true;
+                                    }
                                 }
                                 break;
                             }
@@ -1718,7 +1727,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 if (m_queueSubmitWithCommandsEnabled)
                     seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
                 VkResult vkQueueWaitIdle_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
-                if (CC_LIKELY(vk)) {
+                if (skipRecoveredQueueWaitIdle) {
+                    GFXSTREAM_WARNING("Skipping recovered vkQueueWaitIdle after seqno deadlock");
+                    skipRecoveredQueueWaitIdle = false;
+                    vkQueueWaitIdle_VkResult_return = VK_SUCCESS;
+                } else if (CC_LIKELY(vk)) {
                     vkQueueWaitIdle_VkResult_return =
                         m_state->on_vkQueueWaitIdle(&m_pool, snapshotApiCallHandle, queue);
                 }

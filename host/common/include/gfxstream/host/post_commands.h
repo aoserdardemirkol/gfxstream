@@ -39,6 +39,7 @@ enum class PostCmd {
     Screenshot = 4,
     Exit = 5,
     Block = 6,
+    ExternalSurface = 7,
 };
 
 struct Post {
@@ -59,6 +60,12 @@ struct Post {
 
     // TODO: remove union here and separate into message structures
     union {
+        struct {
+            int width;
+            int height;
+            int rotation;
+            bool visible;
+        } externalSurface;
         IColorBuffer* cb;
         struct {
             int width;

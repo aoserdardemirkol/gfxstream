@@ -116,6 +116,10 @@ std::unique_ptr<ColorBufferVkImageInfo> ColorBufferVk::prepareForDisplay() {
     return mVkEmulation.prepareColorBufferForDisplay(mHandle);
 }
 
+std::shared_ptr<VimaScanoutSync> ColorBufferVk::scanoutSync() {
+    return mVkEmulation.scanoutSync(mHandle);
+}
+
 std::optional<BlobDescriptorInfo> ColorBufferVk::exportBlob() {
     auto info = mVkEmulation.exportColorBufferMemory(mHandle);
     if (info) {

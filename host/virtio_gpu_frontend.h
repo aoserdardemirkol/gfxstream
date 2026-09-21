@@ -86,7 +86,9 @@ class VirtioGpuFrontend {
 
     int getResourceInfo(uint32_t resId, struct stream_renderer_resource_info* info);
 
-    void flushResource(uint32_t res_handle);
+    // |completed| is told whether the post reached the display worker, so an embedder can
+    // report a failed flush to the guest instead of acknowledging it.
+    void flushResource(uint32_t res_handle, std::function<void(bool)> completed = {});
 
     int createRingBlob(VirtioGpuResource& entry, uint32_t res_handle,
                        const struct stream_renderer_create_blob* create_blob,

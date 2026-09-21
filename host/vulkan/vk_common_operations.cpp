@@ -834,8 +834,11 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
 #if defined(__APPLE__)
     const std::string vulkanIcd = gfxstream::base::getEnvironmentVariable("ANDROID_EMU_VK_ICD");
     const bool useMoltenVK = (vulkanIcd == "moltenvk");
+    // KosmicKrisp is a native Vulkan-on-Metal driver and does not implement
+    // VK_KHR_portability_enumeration. MoltenVK still needs the portability bit.
+    const bool useKosmicKrisp = (vulkanIcd == "kosmickrisp");
     const bool usePortabilityEnumeration =
-        vk_util::extensionsSupported(instanceExts, portabilityEnumerationNames);
+        !useKosmicKrisp && vk_util::extensionsSupported(instanceExts, portabilityEnumerationNames);
 #endif
 
     VkApplicationInfo appInfo = {
@@ -5175,6 +5178,13 @@ void VkEmulation::setColorBufferCurrentLayout(uint32_t colorBufferHandle, VkImag
     infoPtr->currentLayout = layout;
 }
 
+std::shared_ptr<VimaScanoutSync> VkEmulation::scanoutSync(uint32_t handle) {
+    if (!vimaExternalPresentation) return nullptr;
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto* info = gfxstream::base::find(mColorBuffers, handle);
+    return info ? info->scanoutSync : nullptr;
+}
+
 VkImageLayout VkEmulation::getColorBufferCurrentLayout(uint32_t colorBufferHandle) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -5430,12 +5440,14 @@ std::unique_ptr<ColorBufferVkImageInfo> VkEmulation::prepareColorBufferForDispla
     compositorInfo->imageCreateInfoShallow = colorBufferInfo->imageCreateInfoShallow;
     compositorInfo->imageFormat = colorBufferInfo->format;
     compositorInfo->preBorrowLayout = colorBufferInfo->currentLayout;
-    compositorInfo->preBorrowQueueFamilyIndex = mQueueFamilyIndex;
+    compositorInfo->preBorrowQueueFamilyIndex = vimaExternalPresentation
+        ? VK_QUEUE_FAMILY_EXTERNAL : mQueueFamilyIndex;
 
     // Instruct the display to perform the queue transfer release after use so
     // that the color buffer can be acquired by the guest.
     compositorInfo->postBorrowQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-    compositorInfo->postBorrowLayout = adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    compositorInfo->postBorrowLayout = vimaExternalPresentation
+        ? colorBufferInfo->currentLayout : adjustImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
     colorBufferInfo->currentLayout = compositorInfo->postBorrowLayout;
     colorBufferInfo->currentQueueFamilyIndex = compositorInfo->postBorrowQueueFamilyIndex;

@@ -36,6 +36,7 @@ extern "C" {
 #include "render-utils/RenderLib.h"
 #include "virtio_gpu_frontend.h"
 #include "vulkan/vk_utils.h"
+#include "vulkan/vima_metal_import.h"
 #include "vulkan/vulkan_dispatch.h"
 
 
@@ -915,3 +916,23 @@ static_assert(offsetof(struct stream_renderer_param, value) == 8,
               "stream_renderer_param.value must be at offset 8");
 
 }  // extern "C"
+
+extern "C" int gfxstream_vima_attach_surface(void* view, int width, int height) {
+    auto* fb = FrameBuffer::getFB();
+    return fb && fb->attachExternalSurface(view, width, height) ? 0 : -1;
+}
+
+extern "C" void gfxstream_vima_update_surface(int width, int height, int rotation, int visible) {
+    if (auto* fb = FrameBuffer::getFB()) fb->updateExternalSurface(width, height, rotation, visible != 0);
+}
+
+extern "C" int gfxstream_vima_post(uint32_t resource, void (*completed)(void*, int),
+                                   void* context) {
+    stream_renderer_resource_info info{};
+    // A non-zero return means the callback was not and will not be invoked, so the embedder
+    // still owns |context|. Once flushResource is entered, the callback always runs.
+    if (!completed || sFrontend()->getResourceInfo(resource, &info)) return -1;
+    sFrontend()->flushResource(
+        resource, [completed, context](bool posted) { completed(context, posted ? 1 : 0); });
+    return 0;
+}

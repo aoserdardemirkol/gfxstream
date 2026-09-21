@@ -828,13 +828,16 @@ int VirtioGpuFrontend::getResourceInfo(uint32_t resourceId,
     return resource.GetInfo(info);
 }
 
-void VirtioGpuFrontend::flushResource(uint32_t res_handle) {
+void VirtioGpuFrontend::flushResource(uint32_t res_handle, std::function<void(bool)> completed) {
     auto taskId = mVirtioGpuTimelines->enqueueTask(VirtioGpuRingGlobal{});
-    FrameBuffer::getFB()->postWithCallback(res_handle,
-                                           [this, taskId](std::shared_future<void> waitForGpu) {
-                                               waitForGpu.wait();
-                                               mVirtioGpuTimelines->notifyTaskCompletion(taskId);
-                                           });
+    FrameBuffer::getFB()->postWithStatus(
+        res_handle,
+        [this, taskId, completed = std::move(completed)](bool posted,
+                                                         std::shared_future<void> waitForGpu) {
+            waitForGpu.wait();
+            mVirtioGpuTimelines->notifyTaskCompletion(taskId);
+            if (completed) completed(posted);
+        });
 }
 
 int VirtioGpuFrontend::createBlob(uint32_t contextId, uint32_t resourceId,

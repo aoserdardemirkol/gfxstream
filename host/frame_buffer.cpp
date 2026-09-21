@@ -348,6 +348,11 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     bool setupSubWindow(FBNativeWindowType p_window, int wx, int wy, int ww, int wh, int fbw,
                         int fbh, float dpr, float zRot, bool deleteExisting, bool hideWindow);
 
+    // Attach an embedder-owned Metal-backed view before submitting frames.
+    // The view remains owned by the embedder until renderer teardown.
+    bool attachExternalSurface(FBNativeWindowType view, int width, int height);
+    void updateExternalSurface(int width, int height, int rotation, bool visible);
+
     bool removeSubWindow();
 
     int getWidth() const { return m_framebufferWidth; }
@@ -415,6 +420,7 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     void postWithCallback(HandleType p_colorbuffer, Post::CompletionCallback callback,
                           bool needLockAndBind = true);
+    void postWithStatus(HandleType p_colorbuffer, FrameBuffer::StatusCompletionCallback callback);
     bool hasGuestPostedAFrame() { return m_guestPostedAFrameTime.has_value(); }
     void resetGuestPostedAFrame() { m_guestPostedAFrameTime = std::nullopt; }
 
@@ -840,6 +846,10 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     float m_dpr = 0;
 
     bool m_useSubWindow = false;
+    bool m_externalSurface = false;
+    bool m_externalSurfaceVisible = true; // accessed on the post worker
+    std::weak_ptr<IColorBuffer> m_externalLastColorBuffer; // never extends allocation lifetime
+
 
     bool m_fpsStats = false;
     int m_statsNumFrames = 0;
@@ -1588,6 +1598,7 @@ WorkerProcessingResult FrameBuffer::Impl::sendReadbackWorkerCmd(const Readback& 
 WorkerProcessingResult FrameBuffer::Impl::postWorkerFunc(Post& post) {
     switch (post.cmd) {
         case PostCmd::Post: {
+            if (m_externalSurface) m_externalLastColorBuffer = findColorBuffer(post.cbHandle);
             // We wrap the callback like this to workaround a bug in the MS STL implementation.
             auto packagePostCmdCallback =
                 std::shared_ptr<Post::CompletionCallback>(std::move(post.completionCallback));
@@ -1600,10 +1611,37 @@ WorkerProcessingResult FrameBuffer::Impl::postWorkerFunc(Post& post) {
                             },
                             "Wait for post");
                     });
-            m_postWorker->post(post.cb, std::move(postCallback), post.colorTransform);
+            if (m_externalSurface && !m_externalSurfaceVisible) {
+                auto ready = std::async(std::launch::deferred, [] {}).share();
+                (*postCallback)(ready);
+            } else {
+                m_postWorker->post(post.cb, std::move(postCallback), post.colorTransform);
+            }
             decColorBufferRefCountNoDestroy(post.cbHandle);
             break;
         }
+        case PostCmd::ExternalSurface:
+            // Serialize surface changes with Vulkan posting, never with the UI thread.
+            if (m_externalSurface && m_displaySurface) {
+                m_externalSurfaceVisible = post.externalSurface.visible;
+                m_zRot = post.externalSurface.rotation;
+                if (m_displaySurface->getWidth() != post.externalSurface.width ||
+                    m_displaySurface->getHeight() != post.externalSurface.height) {
+                    m_displaySurface->updateSize(post.externalSurface.width,
+                                                 post.externalSurface.height);
+                }
+                // Redraw an idle/just-restored window only while a fresh renderer
+                // read lease is available. Never reuse an exported texture pointer.
+                if (m_externalSurfaceVisible) {
+                    if (auto last = m_externalLastColorBuffer.lock()) {
+                        m_postWorker->post(last.get(),
+                            std::make_unique<Post::CompletionCallback>(
+                                [last](std::shared_future<void> done) { done.wait(); }),
+                            std::nullopt);
+                    }
+                }
+            }
+            break;
         case PostCmd::Viewport:
             m_postWorker->viewport(post.viewport.width,
                                    post.viewport.height);
@@ -1732,6 +1770,29 @@ static void subWindowRepaint(void* param) {
     GFXSTREAM_DEBUG("call repost from subWindowRepaint callback");
     auto fb = static_cast<FrameBuffer*>(param);
     fb->repost();
+}
+
+bool FrameBuffer::Impl::attachExternalSurface(FBNativeWindowType view, int width, int height) {
+    if (!view || width <= 0 || height <= 0 || !m_displayVk || m_subWin) return false;
+    auto surface = m_emulationVk->createDisplaySurface(view, width, height);
+    if (!surface) return false;
+    for (auto* user : m_displaySurfaceUsers) user->unbindFromSurface();
+    m_displaySurface = std::move(surface);
+    for (auto* user : m_displaySurfaceUsers) user->bindToSurface(m_displaySurface.get());
+    m_subWin = (EGLNativeWindowType)view;
+    m_externalSurface = true;
+    m_emulationVk->vimaExternalPresentation = true;
+    m_dpr = 1.0f;
+    setVsyncHz(120);
+    return true;
+}
+
+void FrameBuffer::Impl::updateExternalSurface(int width, int height, int rotation, bool visible) {
+    if (!m_externalSurface || width <= 0 || height <= 0) return;
+    Post post{};
+    post.cmd = PostCmd::ExternalSurface;
+    post.externalSurface = {width, height, rotation, visible};
+    sendPostWorkerCmd(std::move(post));
 }
 
 bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int wy, int ww, int wh,
@@ -1972,7 +2033,8 @@ bool FrameBuffer::Impl::removeSubWindow_locked() {
         }
         m_displaySurface.reset();
 
-        destroySubWindow(m_subWin);
+        if (!m_externalSurface) destroySubWindow(m_subWin);
+        m_externalSurface = false;
 
         m_subWin = (EGLNativeWindowType)0;
         removed = true;
@@ -2576,6 +2638,25 @@ void FrameBuffer::Impl::postWithCallback(HandleType p_colorbuffer,
         // should always ensure the callback fires.
         std::shared_future<void> callbackRes = std::async(std::launch::deferred, [] {});
         callback(callbackRes);
+    }
+}
+
+void FrameBuffer::Impl::postWithStatus(HandleType p_colorbuffer,
+                                       FrameBuffer::StatusCompletionCallback callback) {
+    // postImpl may fire the callback on another thread before it returns, so the status has
+    // to travel with the callback rather than being read afterwards.
+    auto shared = std::make_shared<FrameBuffer::StatusCompletionCallback>(std::move(callback));
+    AsyncResult res = postImpl(
+        p_colorbuffer,
+        [shared](std::shared_future<void> waitForGpu) { (*shared)(true, waitForGpu); },
+        /*needLockAndBind=*/true);
+    if (res.Succeeded()) {
+        setGuestPostedAFrame();
+    }
+
+    if (!res.CallbackScheduledOrFired()) {
+        std::shared_future<void> callbackRes = std::async(std::launch::deferred, [] {});
+        (*shared)(false, callbackRes);
     }
 }
 
@@ -4495,6 +4576,14 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window, int wx, int wy, in
                                  hideWindow);
 }
 
+bool FrameBuffer::attachExternalSurface(FBNativeWindowType view, int width, int height) {
+    return mImpl->attachExternalSurface(view, width, height);
+}
+
+void FrameBuffer::updateExternalSurface(int width, int height, int rotation, bool visible) {
+    mImpl->updateExternalSurface(width, height, rotation, visible);
+}
+
 bool FrameBuffer::removeSubWindow() { return mImpl->removeSubWindow(); }
 
 int FrameBuffer::getWidth() const { return mImpl->getWidth(); }
@@ -4612,6 +4701,10 @@ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLockAndBind) {
 void FrameBuffer::postWithCallback(HandleType p_colorbuffer, Post::CompletionCallback callback,
                                    bool needLockAndBind) {
     mImpl->postWithCallback(p_colorbuffer, callback, needLockAndBind);
+}
+
+void FrameBuffer::postWithStatus(HandleType p_colorbuffer, StatusCompletionCallback callback) {
+    mImpl->postWithStatus(p_colorbuffer, std::move(callback));
 }
 
 bool FrameBuffer::hasGuestPostedAFrame() { return mImpl->hasGuestPostedAFrame(); }

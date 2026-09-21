@@ -31,6 +31,7 @@
 #include "goldfish_vk_private_defs.h"
 #include "vk_common_operations.h"
 #include "vk_qsri_timeline.h"
+#include "vima_scanout_sync.h"
 
 namespace gfxstream {
 namespace host {
@@ -43,6 +44,7 @@ struct VulkanDispatch;
 // Android native buffer backing.
 
 class AndroidNativeBufferInfo {
+    std::shared_ptr<VimaScanoutSync> mScanoutSync;
    public:
     static std::unique_ptr<AndroidNativeBufferInfo> create(
         VkEmulation* emu, VulkanDispatch* vk, VkDevice device, gfxstream::base::BumpPool& allocator,

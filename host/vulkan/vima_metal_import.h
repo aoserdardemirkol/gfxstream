@@ -57,6 +57,19 @@ GFXSTREAM_VIMA_EXPORT void gfxstream_vima_set_colorbuffer_texture_sink(
 GFXSTREAM_VIMA_EXPORT GfxstreamVimaColorBufferTextureFn
 gfxstream_vima_get_colorbuffer_texture_sink(void);
 
+
+/** Native Vulkan presentation. Attach is called on the UI thread before guest start.
+ * Updates enqueue work; post completion runs off the UI thread after GPU consumption.
+ * The embedder must keep the view alive for the renderer lifetime.
+ */
+GFXSTREAM_VIMA_EXPORT int gfxstream_vima_attach_surface(void* view, int width, int height);
+GFXSTREAM_VIMA_EXPORT void gfxstream_vima_update_surface(int width, int height, int rotation, int visible);
+/** |completed| receives |context| and 1 when the frame reached the display worker, 0 when the
+ * post failed. A non-zero return means the callback will never run and |context| is still the
+ * caller's to release. */
+GFXSTREAM_VIMA_EXPORT int gfxstream_vima_post(uint32_t resource, void (*completed)(void*, int),
+                                              void* context);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

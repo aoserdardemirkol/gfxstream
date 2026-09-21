@@ -109,6 +109,11 @@ class FrameBuffer : public gfxstream::base::EventNotificationSupport<FrameBuffer
 
     // Remove the sub-window created by setupSubWindow(), if any.
     // Return true on success, false otherwise.
+    // Attach an embedder-owned Metal-backed view before submitting frames.
+    // The view remains owned by the embedder until renderer teardown.
+    bool attachExternalSurface(FBNativeWindowType view, int width, int height);
+    void updateExternalSurface(int width, int height, int rotation, bool visible);
+
     bool removeSubWindow();
 
     // Return a pointer to the global instance. initialize() must be called
@@ -267,6 +272,12 @@ class FrameBuffer : public gfxstream::base::EventNotificationSupport<FrameBuffer
     // until after this function has returned. If the callback is deferred, then it
     // will be dispatched to run on SyncThread.
     void postWithCallback(HandleType p_colorbuffer, Post::CompletionCallback callback, bool needLockAndBind = true);
+    // Like postWithCallback, but tells the completion whether the post actually reached the
+    // display worker. postWithCallback fires its callback even when postImpl failed outright
+    // (an unknown ColorBuffer handle, for one), which an embedder that reports flush status
+    // back to the guest cannot distinguish. VIMA's native presenter needs that distinction.
+    using StatusCompletionCallback = std::function<void(bool posted, std::shared_future<void>)>;
+    void postWithStatus(HandleType p_colorbuffer, StatusCompletionCallback callback);
     bool hasGuestPostedAFrame();
     void resetGuestPostedAFrame();
 

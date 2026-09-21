@@ -348,6 +348,7 @@ class VkEmulation {
     };
 
     struct ColorBufferInfo {
+        std::shared_ptr<VimaScanoutSync> scanoutSync = std::make_shared<VimaScanoutSync>();
         ExternalMemoryInfo memory;
 
         uint32_t handle;
@@ -476,6 +477,9 @@ class VkEmulation {
         VkExternalMemoryProperties props, VkExternalMemoryHandleTypeFlags wantedGuestHandleType);
 
     void setColorBufferCurrentLayout(uint32_t colorBufferHandle, VkImageLayout);
+    // Set before starting guest decoders; only the externally embedded presenter uses this.
+    bool vimaExternalPresentation = false;
+    std::shared_ptr<VimaScanoutSync> scanoutSync(uint32_t colorBufferHandle);
 
     VkImageLayout getColorBufferCurrentLayout(uint32_t colorBufferHandle);
 

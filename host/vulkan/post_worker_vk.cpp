@@ -58,12 +58,34 @@ std::shared_future<void> PostWorkerVk::postImpl(
 
     std::vector<std::unique_ptr<ColorBufferVkImageInfo>> borrowedImages;
     DisplayVk::Post postCmd;
+    struct ScanoutReads {
+        std::vector<std::shared_ptr<VimaScanoutSync>> sources;
+        ~ScanoutReads() { for (auto& source : sources) source->releaseDisplay(); }
+    } reads;
 
     auto addPostImage = [&](IColorBuffer* colorBuffer, int32_t x, int32_t y, int32_t w, int32_t h,
                             float rotation,
                             const std::optional<std::array<float, 16>>& transform = std::nullopt) {
-        colorBuffer->invalidateForBackend(Backend::VK);
         auto cbVk = colorBuffer->getColorBufferVk();
+        auto sync = cbVk ? cbVk->scanoutSync() : nullptr;
+        if (sync) {
+            // If Android already reacquired this buffer, its unfenced flush
+            // is stale. Drop it without reading concurrently with its producer.
+            if (!sync->tryAcquireDisplay()) {
+                if (!m_loggedScanoutDrop) {
+                    GFXSTREAM_INFO("VIMA: skipped scanout whose producer owns the buffer or is not ready");
+                    m_loggedScanoutDrop = true;
+                }
+                return;
+            }
+            if (!m_loggedScanoutRead) {
+                GFXSTREAM_INFO("VIMA: native scanout acquired a producer-complete source");
+                m_loggedScanoutRead = true;
+            }
+            reads.sources.push_back(std::move(sync));
+            postCmd.waitForSourceRelease = true;
+        }
+        colorBuffer->invalidateForBackend(Backend::VK);
         auto info = cbVk ? cbVk->prepareForDisplay() : nullptr;
         if (!info) return;
 
@@ -185,10 +207,12 @@ std::shared_future<void> PostWorkerVk::postImpl(
         addPostImage(cb, 0, 0, 0, 0, static_cast<float>(m_globalState->getZrot()), colorTransform);
     }
 
+    if (postCmd.layers.empty()) return completedFuture;
     constexpr const int kMaxPostRetries = 2;
     for (int i = 0; i < kMaxPostRetries; i++) {
         auto result = m_displayVk->post(postCmd);
         if (result.success) {
+            if (!reads.sources.empty()) result.postCompletedWaitable.wait();
             return result.postCompletedWaitable;
         }
     }

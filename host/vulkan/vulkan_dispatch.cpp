@@ -156,46 +156,30 @@ static void initIcdPaths(bool forTesting) {
         }
     } else {
 #ifdef __APPLE__
-        // Mac: Use MoltenVK by default unless GPU mode is set to swiftshader
+        // Mac: KosmicKrisp is the only supported native Vulkan driver.
         const bool verboseLogs =
             (gfxstream::base::getEnvironmentVariable("ANDROID_EMUGL_VERBOSE") == "1");
         if (androidIcd == "kosmickrisp") {
             gfxstream::base::setEnvironmentVariable("ANDROID_EMU_VK_ICD", "kosmickrisp");
-            setIcdPaths("libkosmickrisp_icd.json");
+            const auto overrideIcd = gfxstream::base::getEnvironmentVariable("VIMA_VK_ICD");
+            if (!overrideIcd.empty() && pathExists(overrideIcd.c_str())) {
+                GFXSTREAM_INFO("Using KosmicKrisp ICD override: %s", overrideIcd.c_str());
+                gfxstream::base::setEnvironmentVariable("VK_DRIVER_FILES", overrideIcd);
+                gfxstream::base::setEnvironmentVariable("VK_ICD_FILENAMES", overrideIcd);
+            } else {
+                if (!overrideIcd.empty()) {
+                    GFXSTREAM_WARNING("Ignoring missing VIMA_VK_ICD override: %s", overrideIcd.c_str());
+                }
+                setIcdPaths("libkosmickrisp_icd.json");
+            }
 
             if (verboseLogs) {
                 gfxstream::base::setEnvironmentVariable("MESA_KK_DEBUG", "1");
             }
         } else {
-            if (androidIcd != "moltenvk") {
-                GFXSTREAM_WARNING("%s: Unknown ICD (%s), resetting to MoltenVK", __func__,
-                                  androidIcd.c_str());
-            }
-            gfxstream::base::setEnvironmentVariable("ANDROID_EMU_VK_ICD", "moltenvk");
-            setIcdPaths("MoltenVK_icd.json");
-            // Configure MoltenVK library with environment variables
-            // 0: No logging.
-            // 1: Log errors only.
-            // 2: Log errors and warning messages.
-            // 3: Log errors, warnings and informational messages.
-            // 4: Log errors, warnings, infos and debug messages.
-            const char* logLevelValue = verboseLogs ? "4" : "1";
-            gfxstream::base::setEnvironmentVariable("MVK_CONFIG_LOG_LEVEL", logLevelValue);
-
-            //  Limit MoltenVK to use single queue, as some older ANGLE versions
-            //  expect this for -guest-angle to work.
-            //  0: Limit Vulkan to a single queue, with no explicit semaphore
-            //  synchronization, and use Metal's implicit guarantees that all operations
-            //  submitted to a queue will give the same result as if they had been run in
-            //  submission order.
-            gfxstream::base::setEnvironmentVariable("MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE", "0");
-
-            // TODO(b/364055067)
-            // MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS is not working correctly
-            gfxstream::base::setEnvironmentVariable("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0");
-
-            // MVK_CONFIG_USE_MTLHEAP is required for VK_EXT_external_memory_metal
-            gfxstream::base::setEnvironmentVariable("MVK_CONFIG_USE_MTLHEAP", "1");
+            GFXSTREAM_ERROR("%s: Unsupported Apple Vulkan ICD '%s'; KosmicKrisp is required.",
+                            __func__, androidIcd.c_str());
+            return;
         }
 #else
         // By default, on other platforms, just use whatever the system

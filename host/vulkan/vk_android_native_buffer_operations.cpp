@@ -150,6 +150,9 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
     }
 
     out->mUseVulkanNativeImage = (emu && emu->isGuestVulkanOnly()) || colorBufferExportedToGl;
+    if (out->mUseVulkanNativeImage) {
+        out->mScanoutSync = emu->scanoutSync(out->mColorBufferHandle);
+    }
 
     VkDeviceSize bindOffset = 0;
     if (out->mExternallyBacked) {
@@ -861,7 +864,10 @@ VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
     VkFence qsriFence = mQsriWaitFencePool->getFenceFromPool();
     std::lock_guard<std::mutex> qLock(*queueMutex);
     VK_CHECK(vk->vkQueueSubmit(queueState.queue, 1, &submitInfo, qsriFence));
-    auto waitForQsriFenceTask = [this, vk, device = mDevice, qsriFence, traceId] {
+    const auto scanoutSync = mScanoutSync;
+    const auto generation = scanoutSync ? scanoutSync->releaseGuest() : 0;
+    auto waitForQsriFenceTask = [this, vk, device = mDevice, qsriFence, traceId,
+                                scanoutSync, generation] {
         (void)traceId;
         GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DEFAULT_CATEGORY, "Wait for QSRI fence",
                               GFXSTREAM_TRACE_FLOW(traceId));
@@ -881,6 +887,12 @@ VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
         }
         VK_ANB_DEBUG_OBJ(this, "wait callback: wait for fence %p...(done)", qsriFence);
         mQsriWaitFencePool->returnFence(qsriFence);
+        // Publish before the guest's producer fence is signaled. A timeout is
+        // not readiness and must never permit a display read.
+        if (scanoutSync) {
+            if (res == VK_SUCCESS) scanoutSync->producerCompleted(generation);
+            else scanoutSync->producerFailed(generation);
+        }
     };
     emu->getGlobalState()->unlockGlobalState();
 

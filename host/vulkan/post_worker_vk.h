@@ -50,6 +50,8 @@ class PostWorkerVk : public PostWorker {
     DisplayVk* const m_displayVk;
     uint32_t m_viewportWidth = 0;
     uint32_t m_viewportHeight = 0;
+    bool m_loggedScanoutRead = false;
+    bool m_loggedScanoutDrop = false;
 };
 
 }  // namespace vk
