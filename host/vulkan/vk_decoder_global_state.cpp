@@ -31,6 +31,8 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <list>
 #include <memory>
@@ -1819,6 +1821,31 @@ class VkDecoderGlobalState::Impl {
         }
     }
 
+    // Android game engines pick a device profile by looking the GPU name up in a table.
+    // Unreal takes the Vulkan deviceName as the GPU family, and anything it does not
+    // recognise lands in its lowest tier: Fortnite ran at LowPerf/30 Hz here purely
+    // because nothing matched. Naming a modern Adreno puts those tables on a tier this
+    // machine can actually drive. It buys nothing beyond that — the guest ICD still
+    // wraps whatever we report in "Virtio-GPU GFXStream (...)", so this can never pass
+    // for a real phone, and the rules that anchor at the start of the string (Fortnite's
+    // Vulkan RHI gate, `^Adreno|^Mali`) stay out of reach. Set VIMA_GPU_NAME=host to
+    // report the real device, or to any other string to report that instead.
+    static const char* vimaDeviceNameOverride() {
+        static const char* const name = []() -> const char* {
+            const char* env = getenv("VIMA_GPU_NAME");
+            if (env && !strcmp(env, "host")) return nullptr;
+            if (env && *env) return env;
+            return "Adreno (TM) 830";
+        }();
+        return name;
+    }
+
+    static void applyDeviceNameOverride(VkPhysicalDeviceProperties* props) {
+        const char* name = vimaDeviceNameOverride();
+        if (!name) return;
+        snprintf(props->deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE, "%s", name);
+    }
+
     void on_vkGetPhysicalDeviceProperties(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
                                           VkPhysicalDevice boxed_physicalDevice,
                                           VkPhysicalDeviceProperties* pProperties) {
@@ -1826,6 +1853,8 @@ class VkDecoderGlobalState::Impl {
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
 
         vk->vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
+
+        applyDeviceNameOverride(pProperties);
 
         m_vkEmulation->applyApiVersionLimits(pProperties->apiVersion);
     }
@@ -1888,6 +1917,8 @@ class VkDecoderGlobalState::Impl {
                 VK_FALSE;
         }
 #endif
+
+        applyDeviceNameOverride(&pProperties->properties);
 
         m_vkEmulation->applyApiVersionLimits(pProperties->properties.apiVersion);
     }
