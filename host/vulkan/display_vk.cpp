@@ -156,6 +156,10 @@ bool DisplayVk::recreateSwapchain() {
     }
     GFXSTREAM_INFO("Creating swapchain with size %" PRIu32 "x%" PRIu32 ".", surface->getWidth(),
                    surface->getHeight());
+    // The drawable is resized here, on the posting thread, and nowhere else: a present copies a
+    // swapchain image into a drawable, so a drawable resized from another thread would sooner or
+    // later be the wrong shape for the images in flight.
+    surfaceVk->setDrawableSize(surface->getWidth(), surface->getHeight());
     auto swapChainCi = SwapChainStateVk::createSwapChainCi(
         m_vk, surfaceVk->getSurface(), m_vkPhysicalDevice, surface->getWidth(),
         surface->getHeight(), {m_swapChainQueueFamilyIndex, m_compositorQueueFamilyIndex});

@@ -34,12 +34,19 @@ class DisplaySurfaceVk : public DisplaySurfaceImpl {
 
    VkSurfaceKHR getSurface() const { return mSurface; }
 
+   // Resizes the drawables the window hands out, on platforms where a drawable is a distinct
+   // thing from a swapchain image. Call it from the thread that creates the swapchain, right
+   // before creating one, so the two can never disagree about the shape. A no-op elsewhere.
+   void setDrawableSize(uint32_t width, uint32_t height) const;
+
   private:
-   DisplaySurfaceVk(const VulkanDispatch& vk, VkInstance vkInstance, VkSurfaceKHR vkSurface);
+   DisplaySurfaceVk(const VulkanDispatch& vk, VkInstance vkInstance, VkSurfaceKHR vkSurface,
+                    FBNativeWindowType window);
 
    const VulkanDispatch& mVk;
    VkInstance mInstance = VK_NULL_HANDLE;
    VkSurfaceKHR mSurface = VK_NULL_HANDLE;
+   FBNativeWindowType mWindow = {};
 };
 
 }  // namespace vk

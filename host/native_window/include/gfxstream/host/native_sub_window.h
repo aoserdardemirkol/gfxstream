@@ -72,6 +72,14 @@ void* getNativeDisplay();
 #if defined(VK_USE_PLATFORM_METAL_EXT)
 // Retrieve metal layer from the view, to create a swapchain surface
 extern void* getMetalLayerFromView(void* view);
+
+// Resize the drawables the view's metal layer hands out.
+//
+// The swapchain images are copied into a drawable at present time, so the drawable size and
+// the swapchain extent have to agree. Only the thread that creates the swapchain may call
+// this, and it must call it before creating one; an embedder that sets the size itself races
+// the posting thread and eventually presents into a drawable of the wrong shape.
+extern void setMetalLayerDrawableSize(void* view, unsigned width, unsigned height);
 #endif
 
 #ifdef __cplusplus

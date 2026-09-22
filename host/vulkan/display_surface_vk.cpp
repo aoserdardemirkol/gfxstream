@@ -103,12 +103,23 @@ std::unique_ptr<DisplaySurfaceVk> DisplaySurfaceVk::create(const VulkanDispatch&
     }
 
     GFXSTREAM_VERBOSE("Created native vulkan surface");
-    return std::unique_ptr<DisplaySurfaceVk>(new DisplaySurfaceVk(vk, instance, surface));
+    return std::unique_ptr<DisplaySurfaceVk>(new DisplaySurfaceVk(vk, instance, surface, window));
 }
 
 DisplaySurfaceVk::DisplaySurfaceVk(const VulkanDispatch& vk, VkInstance instance,
-                                   VkSurfaceKHR surface)
-    : mVk(vk), mInstance(instance), mSurface(surface) {}
+                                   VkSurfaceKHR surface, FBNativeWindowType window)
+    : mVk(vk), mInstance(instance), mSurface(surface), mWindow(window) {}
+
+void DisplaySurfaceVk::setDrawableSize(uint32_t width, uint32_t height) const {
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+    if (mWindow) {
+        setMetalLayerDrawableSize(mWindow, width, height);
+    }
+#else
+    (void)width;
+    (void)height;
+#endif
+}
 
 DisplaySurfaceVk::~DisplaySurfaceVk() {
     if (mSurface != VK_NULL_HANDLE) {

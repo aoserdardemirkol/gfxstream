@@ -15,6 +15,7 @@
  */
 #import <QuartzCore/CALayer.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 
 #include <Cocoa/Cocoa.h>
 #include "gfxstream/host/native_sub_window.h"
@@ -155,4 +156,21 @@ void* getMetalLayerFromView(void* view) {
     NSView* nativeView = (NSView*)view;
     CALayer* layer = nativeView.layer;
     return [layer isKindOfClass:[CAMetalLayer class]] ? layer : nullptr;
+}
+
+void setMetalLayerDrawableSize(void* view, unsigned width, unsigned height) {
+    CAMetalLayer* layer = (CAMetalLayer*)getMetalLayerFromView(view);
+    if (!layer || width == 0 || height == 0) {
+        return;
+    }
+    CGSize size = CGSizeMake((CGFloat)width, (CGFloat)height);
+    if (CGSizeEqualToSize(layer.drawableSize, size)) {
+        return;
+    }
+    // Off the main thread, so it needs its own transaction. Without one the change would sit
+    // in whatever implicit transaction the posting thread happens to have open.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    layer.drawableSize = size;
+    [CATransaction commit];
 }
