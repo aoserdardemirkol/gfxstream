@@ -18,6 +18,8 @@
 #import <QuartzCore/CATransaction.h>
 
 #include <Cocoa/Cocoa.h>
+#include <dispatch/dispatch.h>
+#include <mutex>
 #include "gfxstream/host/native_sub_window.h"
 
 /*
@@ -152,10 +154,54 @@ void* getNativeDisplay() {
 
 // Retrieve metal layer from the view, to create a swapchain surface
 // To be used with VK_EXT_metal_surface
-void* getMetalLayerFromView(void* view) {
-    NSView* nativeView = (NSView*)view;
+//
+// `-[NSView layer]` is main-thread-only, but gfxstream asks from its render thread, and
+// again on every resize. The layer of a given view never changes, so it is read once, on the
+// main thread, and remembered.
+static CAMetalLayer* readMetalLayerOnMainThread(NSView* nativeView) {
     CALayer* layer = nativeView.layer;
-    return [layer isKindOfClass:[CAMetalLayer class]] ? layer : nullptr;
+    return [layer isKindOfClass:[CAMetalLayer class]] ? (CAMetalLayer*)layer : nullptr;
+}
+
+void* getMetalLayerFromView(void* view) {
+    static std::mutex cacheLock;
+    static void* cachedView = nullptr;
+    static CAMetalLayer* cachedLayer = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(cacheLock);
+        if (view && view == cachedView) {
+            return cachedLayer;
+        }
+    }
+
+    NSView* nativeView = (NSView*)view;
+    __block CAMetalLayer* layer = nullptr;
+    if ([NSThread isMainThread]) {
+        layer = readMetalLayerOnMainThread(nativeView);
+    } else {
+        // CFRunLoopPerformBlock rather than dispatch_get_main_queue: VIMA runs NSApplication
+        // from inside its async main task, where the main dispatch queue is never drained.
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+            layer = readMetalLayerOnMainThread(nativeView);
+            dispatch_semaphore_signal(done);
+        });
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+        if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) != 0) {
+            // The main thread is busy or gone; read directly rather than fail the swapchain.
+            // `done` is leaked on purpose: the block may still run and signal it.
+            return readMetalLayerOnMainThread(nativeView);
+        }
+        dispatch_release(done);
+    }
+
+    if (layer) {
+        std::lock_guard<std::mutex> lock(cacheLock);
+        cachedView = view;
+        cachedLayer = layer;
+    }
+    return layer;
 }
 
 void setMetalLayerDrawableSize(void* view, unsigned width, unsigned height) {
