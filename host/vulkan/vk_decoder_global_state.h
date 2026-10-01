@@ -16,6 +16,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include "vima_capability_exposure.h"
+
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -65,6 +67,16 @@ class VkEmulation;
 // functions.
 class VkDecoderGlobalState {
    public:
+    static constexpr uint64_t kVimaExposeGeometryShader = gfxstream::host::vk::kVimaExposeGeometryShader;
+    static constexpr uint64_t kVimaExposeCustomBorderColor = gfxstream::host::vk::kVimaExposeCustomBorderColor;
+    static constexpr uint64_t kVimaExposeBorderColorSwizzle = gfxstream::host::vk::kVimaExposeBorderColorSwizzle;
+    static constexpr uint64_t kVimaExposeTransformFeedback = gfxstream::host::vk::kVimaExposeTransformFeedback;
+    static constexpr uint64_t kVimaExposePrimitivesGeneratedQuery = gfxstream::host::vk::kVimaExposePrimitivesGeneratedQuery;
+    static constexpr uint64_t kVimaExposeAllCapabilities = gfxstream::host::vk::kVimaExposeAllCapabilities;
+    static void setVimaCapabilityExposureMask(uint64_t allowedMask);
+    static uint64_t vimaCapabilityExposureMask();
+    static bool vimaCapabilityExposureAllowed(uint64_t capabilityBit);
+
     VkDecoderGlobalState(VkEmulation* emulation);
     ~VkDecoderGlobalState();
 
@@ -609,6 +621,9 @@ class VkDecoderGlobalState {
     void on_vkCmdExecuteCommands(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
                                  VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
                                  const VkCommandBuffer* pCommandBuffers);
+
+    // VIMA Workload Inspector: records that a decoded draw uses the currently bound pipeline.
+    void on_VimaInspectorDraw(VkCommandBuffer commandBuffer);
 
     VkResult on_vkQueueSubmit(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
                               VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,

@@ -583,6 +583,7 @@ struct PipelineLayoutInfo {
 
 struct PipelineInfo {
     VkDevice device;
+    uint8_t vimaInspectorStageBits = 0;
 };
 
 struct RenderPassInfo {
@@ -606,6 +607,9 @@ struct CommandBufferInfo {
     // Most recently bound compute pipeline and descriptor sets. We save it here so that we can
     // restore it after doing emulated texture decompression.
     VkPipeline computePipeline = VK_NULL_HANDLE;
+    VkPipeline graphicsPipeline = VK_NULL_HANDLE;
+    uint8_t vimaInspectorRecordedStageBits = 0;
+    bool vimaInspectorRecordedDraw = false;
     uint32_t firstSet = 0;
     VkPipelineLayout descriptorLayout = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> currentDescriptorSets;
@@ -622,6 +626,9 @@ struct CommandBufferInfo {
     void reset() {
         subCmds.clear();
         computePipeline = VK_NULL_HANDLE;
+        graphicsPipeline = VK_NULL_HANDLE;
+        vimaInspectorRecordedStageBits = 0;
+        vimaInspectorRecordedDraw = false;
         firstSet = 0;
         descriptorLayout = VK_NULL_HANDLE;
         currentDescriptorSets.clear();

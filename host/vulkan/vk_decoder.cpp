@@ -53,6 +53,7 @@
 #include "goldfish_vk_private_defs.h"
 #include "vk_decoder_global_state.h"
 #include "vk_decoder_snapshot.h"
+#include "vima_workload_inspector.h"
 #include "vulkan_boxed_handles.h"
 #include "vulkan_dispatch.h"
 #include "vulkan_stream.h"
@@ -207,6 +208,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                                const ProcessResources* processResources,
                                const VkDecoderContext& context) {
     const char* processName = context.processName;
+    VimaWorkloadInspector::get().setDecoderContext(processName, context.puid);
     auto& gfx_logger = *context.gfxApiLogger;
     auto& shouldExit = *context.shouldExit;
     if (len < 8) return 0;
@@ -229,6 +231,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
         // large
         if (packetLen < 8 || packetLen > MAX_PACKET_LENGTH) {
             GFXSTREAM_WARNING("Bad packet length %d detected, decode may fail", packetLen);
+            VimaWorkloadInspector::get().decoderError(
+                "bad Vulkan packet length " + std::to_string(packetLen));
         }
 
         if (end - ptr < packetLen) return ptr - (unsigned char*)buf;
@@ -8269,6 +8273,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     vk->vkCmdDraw(unboxed_commandBuffer, vertexCount, instanceCount, firstVertex,
                                   firstInstance);
                 }
+                m_state->on_VimaInspectorDraw(commandBuffer);
                 vkStream->unsetHandleMapping();
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->vkCmdDraw(&m_pool, snapshotApiCallHandle, packet,
@@ -8320,6 +8325,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     vk->vkCmdDrawIndexed(unboxed_commandBuffer, indexCount, instanceCount,
                                          firstIndex, vertexOffset, firstInstance);
                 }
+                m_state->on_VimaInspectorDraw(commandBuffer);
                 vkStream->unsetHandleMapping();
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->vkCmdDrawIndexed(
@@ -8368,6 +8374,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                 if (CC_LIKELY(vk)) {
                     vk->vkCmdDrawIndirect(unboxed_commandBuffer, buffer, offset, drawCount, stride);
                 }
+                m_state->on_VimaInspectorDraw(commandBuffer);
                 vkStream->unsetHandleMapping();
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->vkCmdDrawIndirect(&m_pool, snapshotApiCallHandle, packet,
@@ -8418,6 +8425,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     vk->vkCmdDrawIndexedIndirect(unboxed_commandBuffer, buffer, offset, drawCount,
                                                  stride);
                 }
+                m_state->on_VimaInspectorDraw(commandBuffer);
                 vkStream->unsetHandleMapping();
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->vkCmdDrawIndexedIndirect(
@@ -11006,6 +11014,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                     vk->vkCmdDrawIndirectCount(unboxed_commandBuffer, buffer, offset, countBuffer,
                                                countBufferOffset, maxDrawCount, stride);
                 }
+                m_state->on_VimaInspectorDraw(commandBuffer);
                 vkStream->unsetHandleMapping();
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->vkCmdDrawIndirectCount(
@@ -11066,6 +11075,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                                                       countBuffer, countBufferOffset, maxDrawCount,
                                                       stride);
                 }
+                m_state->on_VimaInspectorDraw(commandBuffer);
                 vkStream->unsetHandleMapping();
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->vkCmdDrawIndexedIndirectCount(
@@ -19523,6 +19533,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                         unboxed_commandBuffer, instanceCount, firstInstance, counterBuffer,
                         counterBufferOffset, counterOffset, vertexStride);
                 }
+                m_state->on_VimaInspectorDraw(commandBuffer);
                 vkStream->unsetHandleMapping();
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->vkCmdDrawIndirectByteCountEXT(
@@ -23457,6 +23468,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
                             opcode, packetLen, processName ? processName : "null");
                     }
                 }
+                VimaWorkloadInspector::get().decoderError(
+                    "unknown Vulkan opcode " + std::to_string(opcode));
                 if (m_snapshotsEnabled) {
                     m_state->snapshot()->destroyApiCallInfoIfUnused(snapshotApiCallHandle);
                 }

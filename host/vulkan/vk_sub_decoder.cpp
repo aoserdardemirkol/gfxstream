@@ -1373,6 +1373,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
                                                 vertexCount, instanceCount, firstVertex,
                                                 firstInstance);
                 }
+                globalstate->on_VimaInspectorDraw(
+                    (VkCommandBuffer)boxed_dispatchHandle);
                 break;
             }
             case OP_vkCmdDrawIndexed: {
@@ -1403,6 +1405,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
                                                        indexCount, instanceCount, firstIndex,
                                                        vertexOffset, firstInstance);
                 }
+                globalstate->on_VimaInspectorDraw(
+                    (VkCommandBuffer)boxed_dispatchHandle);
                 break;
             }
             case OP_vkCmdDrawIndirect: {
@@ -1431,6 +1435,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
                                                         (VkCommandBuffer)(boxed_dispatchHandle),
                                                         buffer, offset, drawCount, stride);
                 }
+                globalstate->on_VimaInspectorDraw(
+                    (VkCommandBuffer)boxed_dispatchHandle);
                 break;
             }
             case OP_vkCmdDrawIndexedIndirect: {
@@ -1459,6 +1465,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
                         pool, snapshotApiCallHandle, nullptr, 0,
                         (VkCommandBuffer)(boxed_dispatchHandle), buffer, offset, drawCount, stride);
                 }
+                globalstate->on_VimaInspectorDraw(
+                    (VkCommandBuffer)boxed_dispatchHandle);
                 break;
             }
             case OP_vkCmdBlitImage: {
@@ -1826,6 +1834,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
                         (VkCommandBuffer)(boxed_dispatchHandle), buffer, offset, countBuffer,
                         countBufferOffset, maxDrawCount, stride);
                 }
+                globalstate->on_VimaInspectorDraw(
+                    (VkCommandBuffer)boxed_dispatchHandle);
                 break;
             }
             case OP_vkCmdDrawIndexedIndirectCount: {
@@ -1864,6 +1874,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
                         (VkCommandBuffer)(boxed_dispatchHandle), buffer, offset, countBuffer,
                         countBufferOffset, maxDrawCount, stride);
                 }
+                globalstate->on_VimaInspectorDraw(
+                    (VkCommandBuffer)boxed_dispatchHandle);
                 break;
             }
             case OP_vkCmdBeginRenderPass2: {
@@ -3954,6 +3966,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
                         (VkCommandBuffer)(boxed_dispatchHandle), instanceCount, firstInstance,
                         counterBuffer, counterBufferOffset, counterOffset, vertexStride);
                 }
+                globalstate->on_VimaInspectorDraw(
+                    (VkCommandBuffer)boxed_dispatchHandle);
                 break;
             }
 #endif

@@ -30,6 +30,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -63,6 +64,7 @@
 #include "trivial_stream.h"
 #include "vk_android_native_buffer_operations.h"
 #include "vk_common_operations.h"
+#include "vima_workload_inspector.h"
 
 #if defined(__APPLE__)
 #include <vulkan/vulkan_metal.h>
@@ -195,12 +197,29 @@ static std::atomic<uint64_t> sUniqueShmemId = 0;
 
 class VkDecoderGlobalState::Impl {
    public:
+    VkInstance inspectorInstanceForPhysicalDevice(VkPhysicalDevice physicalDevice) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto* info = gfxstream::base::find(mPhysdevInfo, physicalDevice);
+        return info ? info->instance : VK_NULL_HANDLE;
+    }
+
     Impl(VkEmulation* emulation)
         : m_vk(vkDispatch()) {
         if (!emulation || !m_vk) {
             GFXSTREAM_FATAL("Cannot initialize VkDecoderGlobalState!");
         }
         m_vkEmulation = emulation;
+        const auto inspectorProps = m_vkEmulation->getPhysicalDeviceProperties();
+        const char* inspectorName = std::getenv("VIMA_GPU_NAME");
+        std::string effectiveName = inspectorProps.deviceName;
+        if (!inspectorName || !*inspectorName) {
+            effectiveName = "Adreno (TM) 830";
+        } else if (std::strcmp(inspectorName, "host") != 0) {
+            effectiveName = inspectorName;
+        }
+        VimaWorkloadInspector::get().setHostIdentity(
+            effectiveName, inspectorProps.vendorID, inspectorProps.deviceID,
+            m_vkEmulation->getGpuDriverInfo());
         mRenderDocWithMultipleVkInstances = m_vkEmulation->getRenderDoc();
         mSnapshotsEnabled = m_vkEmulation->getFeatures().VulkanSnapshots.enabled();
         mBatchedDescriptorSetUpdateEnabled =
@@ -1212,6 +1231,7 @@ class VkDecoderGlobalState::Impl {
         }
         if (res != VK_SUCCESS) {
             GFXSTREAM_WARNING("Failed to create Vulkan instance: %s.", string_VkResult(res));
+            VimaWorkloadInspector::get().vulkanErrorForCurrentProcess("vkCreateInstance", res);
             return res;
         }
 
@@ -1253,6 +1273,9 @@ class VkDecoderGlobalState::Impl {
 
         VALIDATE_NEW_HANDLE_INFO_ENTRY(mInstanceInfo, *pInstance);
         mInstanceInfo[*pInstance] = info;
+
+        VimaWorkloadInspector::get().instanceCreated(*pInstance, info.applicationName,
+                                                     info.engineName, info.isAngle);
 
         *pInstance = (VkInstance)info.boxed;
 
@@ -1318,6 +1341,7 @@ class VkDecoderGlobalState::Impl {
         // remove it from the cleanup callback mapping.
         m_vkEmulation->getGlobalState()->unregisterProcessCleanupCallback(instance);
 
+        VimaWorkloadInspector::get().instanceDestroyed(instance);
         vkDestroyInstanceImpl(instance);
     }
 
@@ -1458,6 +1482,11 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
+        VimaWorkloadInspector::get().probeQuery(
+            instance, "vkEnumeratePhysicalDevices",
+            "result=" + std::string(string_VkResult(res)) + " count=" +
+                std::to_string(availableCount) + " requested=" + std::to_string(requestedCount));
+
         return res;
     }
 
@@ -1471,6 +1500,11 @@ class VkDecoderGlobalState::Impl {
 
         pFeatures->textureCompressionETC2 |= enableEmulatedEtc2();
         pFeatures->textureCompressionASTC_LDR |= enableEmulatedAstc();
+        VkPhysicalDeviceFeatures2 filteredFeatures{};
+        filteredFeatures.features = *pFeatures;
+        filterVimaPhysicalDeviceFeatures(&filteredFeatures,
+                                         VkDecoderGlobalState::vimaCapabilityExposureMask());
+        *pFeatures = filteredFeatures.features;
 
         if (mDisableSparseBindingSupport && pFeatures->sparseBinding) {
             pFeatures->sparseBinding = VK_FALSE;
@@ -1483,6 +1517,17 @@ class VkDecoderGlobalState::Impl {
             pFeatures->sparseResidency16Samples = VK_FALSE;
             pFeatures->sparseResidencyAliased = VK_FALSE;
         }
+        const VkInstance owner = inspectorInstanceForPhysicalDevice(physicalDevice);
+        VimaWorkloadInspector::get().geometryShaderFeatureQuery(
+            owner, pFeatures->geometryShader == VK_TRUE);
+        VimaWorkloadInspector::get().probeQuery(
+            owner, "vkGetPhysicalDeviceFeatures",
+            std::string("geometryShader=") + (pFeatures->geometryShader ? "true" : "false") +
+                " tessellationShader=" + (pFeatures->tessellationShader ? "true" : "false") +
+                " multiViewport=" + (pFeatures->multiViewport ? "true" : "false") +
+                " samplerAnisotropy=" + (pFeatures->samplerAnisotropy ? "true" : "false") +
+                " textureCompressionETC2=" + (pFeatures->textureCompressionETC2 ? "true" : "false") +
+                " textureCompressionASTC_LDR=" + (pFeatures->textureCompressionASTC_LDR ? "true" : "false"));
     }
 
     void on_vkGetPhysicalDeviceFeatures2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -1602,6 +1647,61 @@ class VkDecoderGlobalState::Impl {
             pFeatures->features.sparseResidency16Samples = VK_FALSE;
             pFeatures->features.sparseResidencyAliased = VK_FALSE;
         }
+        filterVimaPhysicalDeviceFeatures(pFeatures,
+                                         VkDecoderGlobalState::vimaCapabilityExposureMask());
+        const auto findVimaFeatureStruct = [&](VkStructureType type) -> VkBaseOutStructure* {
+            auto* current = reinterpret_cast<VkBaseOutStructure*>(pFeatures->pNext);
+            while (current != nullptr) {
+                if (current->sType == type) return current;
+                current = current->pNext;
+            }
+            return nullptr;
+        };
+        if (auto* feature = reinterpret_cast<VkPhysicalDeviceCustomBorderColorFeaturesEXT*>(
+                findVimaFeatureStruct(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT))) {
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "customBorderColors", feature->customBorderColors == VK_TRUE);
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "customBorderColorWithoutFormat",
+                feature->customBorderColorWithoutFormat == VK_TRUE);
+        }
+        if (auto* feature = reinterpret_cast<VkPhysicalDeviceBorderColorSwizzleFeaturesEXT*>(
+                findVimaFeatureStruct(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT))) {
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "borderColorSwizzle", feature->borderColorSwizzle == VK_TRUE);
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "borderColorSwizzleFromImage",
+                feature->borderColorSwizzleFromImage == VK_TRUE);
+        }
+        if (auto* feature = reinterpret_cast<VkPhysicalDeviceTransformFeedbackFeaturesEXT*>(
+                findVimaFeatureStruct(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT))) {
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "transformFeedback", feature->transformFeedback == VK_TRUE);
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "geometryStreams", feature->geometryStreams == VK_TRUE);
+        }
+        if (auto* feature = reinterpret_cast<VkPhysicalDevicePrimitivesGeneratedQueryFeaturesEXT*>(
+                findVimaFeatureStruct(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVES_GENERATED_QUERY_FEATURES_EXT))) {
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "primitivesGeneratedQuery",
+                feature->primitivesGeneratedQuery == VK_TRUE);
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "primitivesGeneratedQueryWithRasterizerDiscard",
+                feature->primitivesGeneratedQueryWithRasterizerDiscard == VK_TRUE);
+            VimaWorkloadInspector::get().capabilityFeatureQuery(
+                physdevInfo->instance, "primitivesGeneratedQueryWithNonZeroStreams",
+                feature->primitivesGeneratedQueryWithNonZeroStreams == VK_TRUE);
+        }
+        VimaWorkloadInspector::get().geometryShaderFeatureQuery(
+            physdevInfo->instance, pFeatures->features.geometryShader == VK_TRUE);
+        VimaWorkloadInspector::get().probeQuery(
+            physdevInfo->instance, "vkGetPhysicalDeviceFeatures2",
+            std::string("geometryShader=") + (pFeatures->features.geometryShader ? "true" : "false") +
+                " tessellationShader=" + (pFeatures->features.tessellationShader ? "true" : "false") +
+                " multiViewport=" + (pFeatures->features.multiViewport ? "true" : "false") +
+                " samplerAnisotropy=" + (pFeatures->features.samplerAnisotropy ? "true" : "false") +
+                " textureCompressionETC2=" + (pFeatures->features.textureCompressionETC2 ? "true" : "false") +
+                " textureCompressionASTC_LDR=" + (pFeatures->features.textureCompressionASTC_LDR ? "true" : "false"));
     }
 
     VkResult on_vkGetPhysicalDeviceImageFormatProperties(
@@ -1610,11 +1710,15 @@ class VkDecoderGlobalState::Impl {
         VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags,
         VkImageFormatProperties* pImageFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
+        const VkInstance inspectorInstance = inspectorInstanceForPhysicalDevice(physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
         const bool emulatedTexture = isEmulatedCompressedTexture(format, physicalDevice, vk);
         if (emulatedTexture) {
             if (!supportEmulatedCompressedImageFormatProperty(format, type, tiling, usage, flags)) {
                 memset(pImageFormatProperties, 0, sizeof(VkImageFormatProperties));
+                VimaWorkloadInspector::get().probeQuery(
+                    inspectorInstance, "vkGetPhysicalDeviceImageFormatProperties",
+                    "result=VK_ERROR_FORMAT_NOT_SUPPORTED format=" + std::to_string(format));
                 return VK_ERROR_FORMAT_NOT_SUPPORTED;
             }
             flags &= ~VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
@@ -1626,11 +1730,19 @@ class VkDecoderGlobalState::Impl {
         VkResult res = vk->vkGetPhysicalDeviceImageFormatProperties(
             physicalDevice, format, type, tiling, usage, flags, pImageFormatProperties);
         if (res != VK_SUCCESS) {
+            VimaWorkloadInspector::get().probeQuery(
+                inspectorInstance, "vkGetPhysicalDeviceImageFormatProperties",
+                "result=" + std::string(string_VkResult(res)) + " format=" +
+                    std::to_string(format));
             return res;
         }
         if (emulatedTexture) {
             maskImageFormatPropertiesForEmulatedTextures(pImageFormatProperties);
         }
+        VimaWorkloadInspector::get().probeQuery(
+            inspectorInstance, "vkGetPhysicalDeviceImageFormatProperties",
+            "result=" + std::string(string_VkResult(res)) + " format=" +
+                std::to_string(format));
         return res;
     }
 
@@ -1640,6 +1752,7 @@ class VkDecoderGlobalState::Impl {
         const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo,
         VkImageFormatProperties2* pImageFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
+        const VkInstance inspectorInstance = inspectorInstanceForPhysicalDevice(physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
         VkPhysicalDeviceImageFormatInfo2 imageFormatInfo;
         VkFormat format = pImageFormatInfo->format;
@@ -1650,6 +1763,10 @@ class VkDecoderGlobalState::Impl {
                     pImageFormatInfo->usage, pImageFormatInfo->flags)) {
                 memset(&pImageFormatProperties->imageFormatProperties, 0,
                        sizeof(VkImageFormatProperties));
+                VimaWorkloadInspector::get().probeQuery(
+                    inspectorInstance, "vkGetPhysicalDeviceImageFormatProperties2",
+                    "result=VK_ERROR_FORMAT_NOT_SUPPORTED format=" +
+                        std::to_string(pImageFormatInfo->format));
                 return VK_ERROR_FORMAT_NOT_SUPPORTED;
             }
             imageFormatInfo = *pImageFormatInfo;
@@ -1709,6 +1826,10 @@ class VkDecoderGlobalState::Impl {
                 &pImageFormatProperties->imageFormatProperties);
         }
         if (res != VK_SUCCESS) {
+            VimaWorkloadInspector::get().probeQuery(
+                physdevInfo->instance, "vkGetPhysicalDeviceImageFormatProperties2",
+                "result=" + std::string(string_VkResult(res)) + " format=" +
+                    std::to_string(pImageFormatInfo->format));
             return res;
         }
 
@@ -1726,6 +1847,11 @@ class VkDecoderGlobalState::Impl {
                 &pImageFormatProperties->imageFormatProperties);
         }
 
+        VimaWorkloadInspector::get().probeQuery(
+            physdevInfo->instance, "vkGetPhysicalDeviceImageFormatProperties2",
+            "result=" + std::string(string_VkResult(res)) + " format=" +
+                std::to_string(pImageFormatInfo->format));
+
         return res;
     }
 
@@ -1735,6 +1861,7 @@ class VkDecoderGlobalState::Impl {
                                                 VkFormat format,
                                                 VkFormatProperties* pFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
+        const VkInstance inspectorInstance = inspectorInstanceForPhysicalDevice(physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
         getPhysicalDeviceFormatPropertiesCore<VkFormatProperties>(
             [vk](VkPhysicalDevice physicalDevice, VkFormat format,
@@ -1742,6 +1869,12 @@ class VkDecoderGlobalState::Impl {
                 vk->vkGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
             },
             vk, physicalDevice, format, pFormatProperties);
+        VimaWorkloadInspector::get().probeQuery(
+            inspectorInstance, "vkGetPhysicalDeviceFormatProperties",
+            "format=" + std::to_string(format) + " buffer=" +
+                std::to_string(pFormatProperties->bufferFeatures) + " optimal=" +
+                std::to_string(pFormatProperties->optimalTilingFeatures) + " linear=" +
+                std::to_string(pFormatProperties->linearTilingFeatures));
     }
 
     void on_vkGetPhysicalDeviceFormatProperties2(gfxstream::base::BumpPool* pool,
@@ -1750,6 +1883,7 @@ class VkDecoderGlobalState::Impl {
                                                  VkFormat format,
                                                  VkFormatProperties2* pFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
+        const VkInstance inspectorInstance = inspectorInstanceForPhysicalDevice(physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
 
         enum class WhichFunc {
@@ -1819,6 +1953,12 @@ class VkDecoderGlobalState::Impl {
                 break;
             }
         }
+        VimaWorkloadInspector::get().probeQuery(
+            inspectorInstance, "vkGetPhysicalDeviceFormatProperties2",
+            "format=" + std::to_string(format) + " buffer=" +
+                std::to_string(pFormatProperties->formatProperties.bufferFeatures) + " optimal=" +
+                std::to_string(pFormatProperties->formatProperties.optimalTilingFeatures) +
+                " linear=" + std::to_string(pFormatProperties->formatProperties.linearTilingFeatures));
     }
 
     // Android game engines pick a device profile by looking the GPU name up in a table.
@@ -1857,6 +1997,15 @@ class VkDecoderGlobalState::Impl {
         applyDeviceNameOverride(pProperties);
 
         m_vkEmulation->applyApiVersionLimits(pProperties->apiVersion);
+        const VkInstance owner = inspectorInstanceForPhysicalDevice(physicalDevice);
+        VimaWorkloadInspector::get().probeQuery(
+            owner, "vkGetPhysicalDeviceProperties",
+            std::string("deviceName=\"") + pProperties->deviceName + "\" vendorID=" +
+                std::to_string(pProperties->vendorID) + " deviceID=" +
+                std::to_string(pProperties->deviceID) + " deviceType=" +
+                std::to_string(pProperties->deviceType) + " apiVersion=" +
+                std::to_string(pProperties->apiVersion) + " driverVersion=" +
+                std::to_string(pProperties->driverVersion));
     }
 
     void on_vkGetPhysicalDeviceProperties2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -1921,6 +2070,14 @@ class VkDecoderGlobalState::Impl {
         applyDeviceNameOverride(&pProperties->properties);
 
         m_vkEmulation->applyApiVersionLimits(pProperties->properties.apiVersion);
+        const auto& props = pProperties->properties;
+        VimaWorkloadInspector::get().probeQuery(
+            physdevInfo->instance, "vkGetPhysicalDeviceProperties2",
+            std::string("deviceName=\"") + props.deviceName + "\" vendorID=" +
+                std::to_string(props.vendorID) + " deviceID=" + std::to_string(props.deviceID) +
+                " deviceType=" + std::to_string(props.deviceType) + " apiVersion=" +
+                std::to_string(props.apiVersion) + " driverVersion=" +
+                std::to_string(props.driverVersion));
     }
 
     void on_vkGetPhysicalDeviceQueueFamilyProperties(
@@ -1951,6 +2108,9 @@ class VkDecoderGlobalState::Impl {
         } else {
             *pQueueFamilyPropertyCount = (uint32_t)properties.size();
         }
+        VimaWorkloadInspector::get().probeQuery(
+            physicalDeviceInfo->instance, "vkGetPhysicalDeviceQueueFamilyProperties",
+            "count=" + std::to_string(*pQueueFamilyPropertyCount));
     }
 
     void on_vkGetPhysicalDeviceQueueFamilyProperties2(
@@ -1988,6 +2148,9 @@ class VkDecoderGlobalState::Impl {
         } else {
             *pQueueFamilyPropertyCount = (uint32_t)properties.size();
         }
+        VimaWorkloadInspector::get().probeQuery(
+            physicalDeviceInfo->instance, "vkGetPhysicalDeviceQueueFamilyProperties2",
+            "count=" + std::to_string(*pQueueFamilyPropertyCount));
     }
 
     void on_vkGetPhysicalDeviceMemoryProperties(
@@ -2006,6 +2169,10 @@ class VkDecoderGlobalState::Impl {
 
         auto& physicalDeviceMemoryHelper = physicalDeviceInfo->memoryPropertiesHelper;
         *pMemoryProperties = physicalDeviceMemoryHelper->getGuestMemoryProperties();
+        VimaWorkloadInspector::get().probeQuery(
+            physicalDeviceInfo->instance, "vkGetPhysicalDeviceMemoryProperties",
+            "memoryTypeCount=" + std::to_string(pMemoryProperties->memoryTypeCount) +
+                " memoryHeapCount=" + std::to_string(pMemoryProperties->memoryHeapCount));
     }
 
     void on_vkGetPhysicalDeviceMemoryProperties2(
@@ -2050,6 +2217,10 @@ class VkDecoderGlobalState::Impl {
 
         physicalDeviceMemoryHelper->clampMemoryBudgetToGuestHeapSizes(
             vk_find_struct<VkPhysicalDeviceMemoryBudgetPropertiesEXT>(pMemoryProperties));
+        VimaWorkloadInspector::get().probeQuery(
+            physicalDeviceInfo->instance, "vkGetPhysicalDeviceMemoryProperties2",
+            "memoryTypeCount=" + std::to_string(pMemoryProperties->memoryProperties.memoryTypeCount) +
+                " memoryHeapCount=" + std::to_string(pMemoryProperties->memoryProperties.memoryHeapCount));
     }
 
     VkResult on_vkEnumerateDeviceExtensionProperties(gfxstream::base::BumpPool* pool,
@@ -2067,6 +2238,11 @@ class VkDecoderGlobalState::Impl {
             enumerateDeviceExtensionProperties(vk, physicalDevice, pLayerName, properties);
         if (result != VK_SUCCESS) {
             GFXSTREAM_ERROR("Failed to query host device extensions.");
+            const VkInstance owner = inspectorInstanceForPhysicalDevice(physicalDevice);
+            VimaWorkloadInspector::get().probeQuery(
+                owner, "vkEnumerateDeviceExtensionProperties",
+                std::string("layer=") + (pLayerName ? pLayerName : "<null>") +
+                    " count=0 result=" + string_VkResult(result));
             return result;
         }
 
@@ -2167,6 +2343,23 @@ class VkDecoderGlobalState::Impl {
             properties.push_back(ycbcr_props);
         }
 
+        filterVimaDeviceExtensions(&properties,
+                                   VkDecoderGlobalState::vimaCapabilityExposureMask());
+
+        const VkInstance inspectorOwner = inspectorInstanceForPhysicalDevice(physicalDevice);
+        VimaWorkloadInspector::get().capabilityExtensionQuery(
+            inspectorOwner, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
+            hasDeviceExtension(properties, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME));
+        VimaWorkloadInspector::get().capabilityExtensionQuery(
+            inspectorOwner, VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME,
+            hasDeviceExtension(properties, VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME));
+        VimaWorkloadInspector::get().capabilityExtensionQuery(
+            inspectorOwner, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
+            hasDeviceExtension(properties, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME));
+        VimaWorkloadInspector::get().capabilityExtensionQuery(
+            inspectorOwner, VK_EXT_PRIMITIVES_GENERATED_QUERY_EXTENSION_NAME,
+            hasDeviceExtension(properties, VK_EXT_PRIMITIVES_GENERATED_QUERY_EXTENSION_NAME));
+
         if (pProperties == nullptr) {
             *pPropertyCount = properties.size();
         } else {
@@ -2174,7 +2367,23 @@ class VkDecoderGlobalState::Impl {
             *pPropertyCount = std::min((uint32_t)properties.size(), *pPropertyCount);
             memcpy(pProperties, properties.data(), *pPropertyCount * sizeof(VkExtensionProperties));
         }
-        return *pPropertyCount < properties.size() ? VK_INCOMPLETE : VK_SUCCESS;
+        result = *pPropertyCount < properties.size() ? VK_INCOMPLETE : VK_SUCCESS;
+        VkInstance owner = inspectorInstanceForPhysicalDevice(physicalDevice);
+        std::string summary = "layer=";
+        summary += pLayerName ? pLayerName : "<null>";
+        summary += " count=" + std::to_string(*pPropertyCount);
+        if (pProperties) {
+            summary += " names=";
+            for (uint32_t i = 0; i < *pPropertyCount; ++i) {
+                if (i) summary += ',';
+                summary += pProperties[i].extensionName;
+            }
+        }
+        summary += " result=";
+        summary += string_VkResult(result);
+        VimaWorkloadInspector::get().probeQuery(
+            owner, "vkEnumerateDeviceExtensionProperties", summary);
+        return result;
     }
 
     VkResult on_vkCreateDevice(gfxstream::base::BumpPool* pool,
@@ -2510,6 +2719,7 @@ class VkDecoderGlobalState::Impl {
 
         if (result != VK_SUCCESS) {
             GFXSTREAM_WARNING("Failed to create VkDevice: %s.", string_VkResult(result));
+            VimaWorkloadInspector::get().vulkanErrorForCurrentProcess("vkCreateDevice", result);
 
             // Provide extra information on specific cases
             if (createInfoFiltered.pEnabledFeatures && result == VK_ERROR_FEATURE_NOT_PRESENT) {
@@ -2520,6 +2730,8 @@ class VkDecoderGlobalState::Impl {
                 vk_util::getMissingFeatures(supported, *createInfoFiltered.pEnabledFeatures,
                                             missingFeatures);
                 GFXSTREAM_WARNING("Missing features: %s", missingFeatures.c_str());
+                VimaWorkloadInspector::get().vulkanErrorForCurrentProcess(
+                    "vkCreateDevice missing features: " + missingFeatures, result);
             } else if (result == VK_ERROR_EXTENSION_NOT_PRESENT) {
                 uint32_t extCount;
                 vk->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount,
@@ -2533,6 +2745,8 @@ class VkDecoderGlobalState::Impl {
                                               createInfoFiltered.ppEnabledExtensionNames,
                                               missingExtensions);
                 GFXSTREAM_WARNING("Missing extensions: %s", missingExtensions.c_str());
+                VimaWorkloadInspector::get().vulkanErrorForCurrentProcess(
+                    "vkCreateDevice missing extensions: " + missingExtensions, result);
             }
             return result;
         }
@@ -2604,6 +2818,7 @@ class VkDecoderGlobalState::Impl {
         deviceInfo.deviceOpTracker = std::make_shared<DeviceOpTracker>(*pDevice, dispatch);
 
         deviceInfo.boxed = boxedDevice;
+        VimaWorkloadInspector::get().deviceCreated(*pDevice, physicalDeviceInfo.instance);
 
         DeviceLostHelper::DeviceWithQueues deviceWithQueues = {
             .device = *pDevice,
@@ -2992,6 +3207,7 @@ class VkDecoderGlobalState::Impl {
 
         std::lock_guard<std::mutex> lock(mMutex);
 
+        VimaWorkloadInspector::get().deviceDestroyed(device);
         destroyDeviceLocked(device);
     }
 
@@ -5387,6 +5603,8 @@ class VkDecoderGlobalState::Impl {
         VkResult result = deviceDispatch->vkCreateGraphicsPipelines(
             device, pipelineCache, createInfoCount, pCreateInfos, nullptr, pPipelines);
         if (result != VK_SUCCESS && result != VK_PIPELINE_COMPILE_REQUIRED) {
+            VimaWorkloadInspector::get().vulkanErrorForDevice(
+                device, "vkCreateGraphicsPipelines", result);
             return result;
         }
 
@@ -5399,6 +5617,22 @@ class VkDecoderGlobalState::Impl {
             VALIDATE_NEW_HANDLE_INFO_ENTRY(mPipelineInfo, pPipelines[i]);
             auto& pipelineInfo = mPipelineInfo[pPipelines[i]];
             pipelineInfo.device = device;
+            for (uint32_t stage = 0; stage < pCreateInfos[i].stageCount; ++stage) {
+                switch (pCreateInfos[i].pStages[stage].stage) {
+                    case VK_SHADER_STAGE_GEOMETRY_BIT:
+                        pipelineInfo.vimaInspectorStageBits |= kVimaInspectorGeometry;
+                        break;
+                    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+                        pipelineInfo.vimaInspectorStageBits |= kVimaInspectorTessControl;
+                        break;
+                    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
+                        pipelineInfo.vimaInspectorStageBits |= kVimaInspectorTessEvaluation;
+                        break;
+                    default: break;
+                }
+            }
+            VimaWorkloadInspector::get().pipelineCreated(
+                device, pipelineInfo.vimaInspectorStageBits);
 
             pPipelines[i] = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
         }
@@ -7849,6 +8083,13 @@ class VkDecoderGlobalState::Impl {
         CommandBufferInfo& cmdBuffer = mCommandBufferInfo[commandBuffer];
         cmdBuffer.subCmds.insert(cmdBuffer.subCmds.end(), pCommandBuffers,
                                  pCommandBuffers + commandBufferCount);
+        for (uint32_t i = 0; i < commandBufferCount; ++i) {
+            auto* secondary = gfxstream::base::find(mCommandBufferInfo, pCommandBuffers[i]);
+            if (!secondary) continue;
+            cmdBuffer.vimaInspectorRecordedDraw |= secondary->vimaInspectorRecordedDraw;
+            cmdBuffer.vimaInspectorRecordedStageBits |=
+                secondary->vimaInspectorRecordedStageBits;
+        }
         if (m_vkEmulation->vimaExternalPresentation) {
             for (uint32_t i = 0; i < commandBufferCount; ++i) {
                 auto* secondary = gfxstream::base::find(mCommandBufferInfo, pCommandBuffers[i]);
@@ -8088,6 +8329,8 @@ class VkDecoderGlobalState::Impl {
         PhysicalQueuePendingOps* pendingOps = nullptr;
         bool sharedQueue = false;
         DeviceOpTracker* deviceOpTracker = nullptr;
+        bool inspectorGraphicsDraw = false;
+        uint8_t inspectorStageBits = 0;
 
         {
             std::lock_guard<std::mutex> lock(mMutex);
@@ -8153,6 +8396,16 @@ class VkDecoderGlobalState::Impl {
             }
 
             deviceOpTracker = deviceInfo->deviceOpTracker.get();
+
+            for (uint32_t i = 0; i < submitCount; ++i) {
+                for (uint32_t j = 0; j < getCommandBufferCount(pSubmits[i]); ++j) {
+                    auto* info = gfxstream::base::find(
+                        mCommandBufferInfo, getCommandBuffer(pSubmits[i], j));
+                    if (!info) continue;
+                    inspectorGraphicsDraw |= info->vimaInspectorRecordedDraw;
+                    inspectorStageBits |= info->vimaInspectorRecordedStageBits;
+                }
+            }
 
             if (mRenderDocWithMultipleVkInstances && m_vkEmulation->supportsFrameBoundary()) {
                 // Check if this is a frame boundary submission, only the first submit call
@@ -8248,6 +8501,8 @@ class VkDecoderGlobalState::Impl {
                 if (result != VK_SUCCESS) {
                     GFXSTREAM_WARNING("dispatchVkQueueSubmit failed: %s [%d]", string_VkResult(result),
                                     result);
+                    VimaWorkloadInspector::get().vulkanErrorForDevice(device, "vkQueueSubmit",
+                                                                      result);
                     for (auto [cb, generation] : scanoutGenerations) {
                         scanoutUses.at(cb)->producerFailed(generation);
                     }
@@ -8288,6 +8543,8 @@ class VkDecoderGlobalState::Impl {
                 if (result != VK_SUCCESS) {
                     GFXSTREAM_WARNING("dispatchVkQueueSubmit failed: %s [%d]", string_VkResult(result),
                                     result);
+                    VimaWorkloadInspector::get().vulkanErrorForDevice(device, "vkQueueSubmit",
+                                                                      result);
                     return result;
                 }
             }
@@ -8434,6 +8691,8 @@ class VkDecoderGlobalState::Impl {
                 }
             }
         }
+        VimaWorkloadInspector::get().queueSubmitted(device, inspectorGraphicsDraw,
+                                                    inspectorStageBits);
         return VK_SUCCESS;
     }
 
@@ -8945,7 +9204,21 @@ class VkDecoderGlobalState::Impl {
             if (cmdBufferInfo) {
                 cmdBufferInfo->computePipeline = pipeline;
             }
+        } else if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+            if (cmdBufferInfo) cmdBufferInfo->graphicsPipeline = pipeline;
         }
+    }
+
+    void on_VimaInspectorDraw(VkCommandBuffer boxed_commandBuffer) {
+        auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto* cmd = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+        if (!cmd) return;
+        cmd->vimaInspectorRecordedDraw = true;
+        auto* pipeline = gfxstream::base::find(mPipelineInfo, cmd->graphicsPipeline);
+        if (pipeline) cmd->vimaInspectorRecordedStageBits |= pipeline->vimaInspectorStageBits;
     }
 
     void on_vkCmdBindDescriptorSets(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -10091,6 +10364,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_DeviceLost() {
+        VimaWorkloadInspector::get().deviceLost();
         m_vkEmulation->getDeviceLostHelper().onDeviceLost();
         GFXSTREAM_FATAL("Encountered device lost.");
     }
@@ -11639,6 +11913,20 @@ VkDecoderGlobalState::VkDecoderGlobalState(VkEmulation* emulation)
 VkDecoderGlobalState::~VkDecoderGlobalState() = default;
 
 static VkDecoderGlobalState* sGlobalDecoderState = nullptr;
+static std::atomic<uint64_t> sVimaCapabilityExposureMask{
+    VkDecoderGlobalState::kVimaExposeAllCapabilities};
+
+void VkDecoderGlobalState::setVimaCapabilityExposureMask(uint64_t allowedMask) {
+    sVimaCapabilityExposureMask.store(allowedMask, std::memory_order_relaxed);
+}
+
+bool VkDecoderGlobalState::vimaCapabilityExposureAllowed(uint64_t capabilityBit) {
+    return gfxstream::host::vk::vimaCapabilityExposureAllowed(vimaCapabilityExposureMask(), capabilityBit);
+}
+
+uint64_t VkDecoderGlobalState::vimaCapabilityExposureMask() {
+    return sVimaCapabilityExposureMask.load(std::memory_order_relaxed);
+}
 
 // static
 void VkDecoderGlobalState::initialize(VkEmulation* emulation) {
@@ -12590,6 +12878,10 @@ void VkDecoderGlobalState::on_vkCmdExecuteCommands(gfxstream::base::BumpPool* po
                                                    const VkCommandBuffer* pCommandBuffers) {
     return mImpl->on_vkCmdExecuteCommands(pool, apiCallHandle, commandBuffer, commandBufferCount,
                                           pCommandBuffers);
+}
+
+void VkDecoderGlobalState::on_VimaInspectorDraw(VkCommandBuffer commandBuffer) {
+    mImpl->on_VimaInspectorDraw(commandBuffer);
 }
 
 VkResult VkDecoderGlobalState::on_vkQueueSubmit(gfxstream::base::BumpPool* pool,

@@ -419,7 +419,9 @@ intptr_t RenderThread::main() {
             anyProgress |= progress;
 
             const char* contextName = nullptr;
-            if (mNameOpt) {
+            if (tInfo->m_processName) {
+                contextName = tInfo->m_processName->c_str();
+            } else if (mNameOpt) {
                 contextName = (*mNameOpt).c_str();
             }
 

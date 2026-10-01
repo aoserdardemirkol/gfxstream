@@ -28,6 +28,7 @@ files_lib_vulkan_server = files(
   'vk_emulated_physical_device_memory.cpp',
   'vk_emulated_physical_device_queue.cpp',
   'vk_decoder_global_state.cpp',
+  'vima_workload_inspector.cpp',
   'vk_decoder_snapshot.cpp',
   'vk_decoder_snapshot_utils.cpp',
   'vk_format_support.cpp',

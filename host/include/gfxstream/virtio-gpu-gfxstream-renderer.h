@@ -154,6 +154,13 @@ typedef void (*stream_renderer_debug_callback_ex)(void* user_data,
 #define STREAM_RENDERER_PARAM_WIN0_HEIGHT 5
 #define STREAM_RENDERER_PARAM_DEBUG_CALLBACK 6
 #define STREAM_RENDERER_PARAM_DEBUG_CALLBACK_EX 7
+// VIMA-only bitmask of guest capability-contract exposure decisions.
+#define STREAM_RENDERER_PARAM_VIMA_CAPABILITY_EXPOSURE_MASK 12
+#define VIMA_CAPABILITY_GEOMETRY_SHADER (1ULL << 0)
+#define VIMA_CAPABILITY_CUSTOM_BORDER_COLOR (1ULL << 1)
+#define VIMA_CAPABILITY_BORDER_COLOR_SWIZZLE (1ULL << 2)
+#define VIMA_CAPABILITY_TRANSFORM_FEEDBACK (1ULL << 3)
+#define VIMA_CAPABILITY_PRIMITIVES_GENERATED_QUERY (1ULL << 4)
 
 // An entry in the stream renderer parameters list.
 // The key should be one of STREAM_RENDERER_PARAM_*

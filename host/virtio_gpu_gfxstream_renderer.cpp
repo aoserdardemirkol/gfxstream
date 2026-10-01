@@ -36,6 +36,7 @@ extern "C" {
 #include "render-utils/RenderLib.h"
 #include "virtio_gpu_frontend.h"
 #include "vulkan/vk_utils.h"
+#include "vulkan/vk_decoder_global_state.h"
 #include "vulkan/vima_metal_import.h"
 #include "vulkan/vulkan_dispatch.h"
 
@@ -584,6 +585,11 @@ VG_EXPORT int stream_renderer_resume() {
 
 VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer_params,
                                    uint64_t num_params) {
+    // Keep non-VIMA callers at the existing host-derived behavior unless they pass the typed
+    // VIMA contract parameter below.
+    gfxstream::host::vk::VkDecoderGlobalState::setVimaCapabilityExposureMask(
+        gfxstream::host::vk::VkDecoderGlobalState::kVimaExposeAllCapabilities);
+
     // Required parameters.
     std::unordered_set<uint64_t> required_params{STREAM_RENDERER_PARAM_USER_DATA,
                                                  STREAM_RENDERER_PARAM_RENDERER_FLAGS,
@@ -598,6 +604,7 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
         {STREAM_RENDERER_PARAM_WIN0_HEIGHT, "WIN0_HEIGHT"},
         {STREAM_RENDERER_PARAM_DEBUG_CALLBACK, "DEBUG_CALLBACK"},
         {STREAM_RENDERER_PARAM_DEBUG_CALLBACK_EX, "DEBUG_CALLBACK_EX"},
+        {STREAM_RENDERER_PARAM_VIMA_CAPABILITY_EXPOSURE_MASK, "VIMA_CAPABILITY_EXPOSURE_MASK"},
         {STREAM_RENDERER_SKIP_OPENGLES_INIT, "SKIP_OPENGLES_INIT"},
     };
 
@@ -683,6 +690,11 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
                 GFXSTREAM_DEBUG("STREAM_RENDERER_PARAM_DEBUG_CALLBACK_EX passed");
                 log_callback_ex = reinterpret_cast<stream_renderer_debug_callback_ex>(
                     static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_VIMA_CAPABILITY_EXPOSURE_MASK: {
+                gfxstream::host::vk::VkDecoderGlobalState::setVimaCapabilityExposureMask(
+                    param.value & gfxstream::host::vk::VkDecoderGlobalState::kVimaExposeAllCapabilities);
                 break;
             }
             case STREAM_RENDERER_SKIP_OPENGLES_INIT: {
