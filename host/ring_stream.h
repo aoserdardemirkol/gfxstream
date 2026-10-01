@@ -79,6 +79,8 @@ class RingStream final : public IOStream {
     uint32_t mUnavailableReadCount = 0;
 
     uint64_t mVimaParkStartUs = 0;
+    // When the ring last went empty, for the hybrid spin-then-park wait.
+    uint64_t mVimaSpinStartUs = 0;
 
     size_t mXmits = 0;
     size_t mTotalRecv = 0;

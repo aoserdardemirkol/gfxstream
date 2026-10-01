@@ -16,6 +16,10 @@
 
 #include <assert.h>
 #include <memory.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <atomic>
 
 #include "gfxstream/host/dma_device.h"
 #include "gfxstream/common/logging.h"
@@ -26,6 +30,34 @@
 
 namespace gfxstream {
 namespace {
+
+// VIMA fork: how long an emptied ring is polled before the consumer parks.
+// EXPERIMENT: /tmp/vima-asg-spin-us, re-read once a second, overrides
+// VIMA_ASG_SPIN_US so the window can be swept on a running game.
+uint64_t vimaSpinWindowUs() {
+    static std::atomic<uint64_t> window{[] {
+        const char* env = getenv("VIMA_ASG_SPIN_US");
+        return env ? strtoull(env, nullptr, 10) : 200ull;
+    }()};
+    static std::atomic<uint64_t> lastCheckUs{0};
+    const uint64_t now = gfxstream::base::getHighResTimeUs();
+    uint64_t last = lastCheckUs.load(std::memory_order_relaxed);
+    if (now - last > 1000000 &&
+        lastCheckUs.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        if (FILE* f = fopen("/tmp/vima-asg-spin-us", "r")) {
+            unsigned long long v;
+            if (fscanf(f, "%llu", &v) == 1) window.store(v, std::memory_order_relaxed);
+            fclose(f);
+        }
+    }
+    return window.load(std::memory_order_relaxed);
+}
+
+inline void vimaCpuRelax() {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
 
 struct asg_context CreateContext(const AsgConsumerCreateInfo& info) {
     struct asg_context context = asg_context_create(info.ring_storage, info.buffer, info.buffer_size);
@@ -224,6 +256,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
         auto ptrEnd = dst + wanted;
 
         if (ringAvailable) {
+            mVimaSpinStartUs = 0;
             inLargeXfer = false;
             uint32_t transferMode =
                 mContext.ring_config->transfer_mode;
@@ -245,6 +278,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
                     break;
             }
         } else if (ringLargeXferAvailable) {
+            mVimaSpinStartUs = 0;
             type3Read(ringLargeXferAvailable,
                       &count, &current, ptrEnd);
             inLargeXfer = true;
@@ -265,6 +299,25 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
                 continue;
             } else {
                 spins = 0;
+            }
+
+            // VIMA fork: hybrid wait. The 30 x 8 empty polls above take a few
+            // microseconds, so the consumer parked almost as soon as the ring
+            // drained. Every guest write after that sees NEED_NOTIFY and has to
+            // ping (a VM exit through the virtio-gpu device plus a thread wakeup),
+            // and a game making many synchronous round trips per frame pays that
+            // on each one: Fortnite ran at ~8 fps with both host decoders and
+            // guest render threads asleep. Keep polling for a short window first,
+            // with host_state still CAN_CONSUME so the guest skips the ping; idle
+            // contexts still park after the window. VIMA_ASG_SPIN_US sets the
+            // window (0 restores the old behaviour).
+            if (!mShouldExit && vimaSpinWindowUs() > 0) {
+                const uint64_t now = gfxstream::base::getHighResTimeUs();
+                if (!mVimaSpinStartUs) mVimaSpinStartUs = now;
+                if (now - mVimaSpinStartUs < vimaSpinWindowUs()) {
+                    vimaCpuRelax();
+                    continue;
+                }
             }
 
             if (mShouldExit) {
@@ -353,6 +406,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
     mTotalRecv += count;
 
     mVimaParkStartUs = 0;
+    mVimaSpinStartUs = 0;
 
     __atomic_store_n(mContext.host_state, ASG_HOST_STATE_RENDERING, __ATOMIC_SEQ_CST);
     return (const unsigned char*)buf;
