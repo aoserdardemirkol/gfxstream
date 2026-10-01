@@ -1200,6 +1200,38 @@ class VkDecoderGlobalState::Impl {
         deepcopy_VkInstanceCreateInfo(pool, VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, pCreateInfo,
                                       &createInfoFiltered);
 
+        std::string vvlAppName = "";
+        std::string vvlEngineName = "";
+        if (pCreateInfo->pApplicationInfo) {
+            if (pCreateInfo->pApplicationInfo->pApplicationName) {
+                vvlAppName = pCreateInfo->pApplicationInfo->pApplicationName;
+            }
+            if (pCreateInfo->pApplicationInfo->pEngineName) {
+                vvlEngineName = pCreateInfo->pApplicationInfo->pEngineName;
+            }
+        }
+
+        VkDebugUtilsMessengerCreateInfoEXT debugInfo = {};
+        std::unique_ptr<VVLContext> debugContext =
+            m_vkEmulation->createVVLContext(vvlAppName, vvlEngineName, &debugInfo);
+
+        if (debugContext) {
+            GFXSTREAM_INFO("Enabling VVL for %s %s", vvlAppName.c_str(), vvlEngineName.c_str());
+
+            bool hasDebugUtils = false;
+            for (const char* ext : finalExts) {
+                if (ext && strcmp(ext, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                    hasDebugUtils = true;
+                    break;
+                }
+            }
+            if (!hasDebugUtils) {
+                finalExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            }
+        } else {
+            GFXSTREAM_VERBOSE("Not enabling VVL for %s %s", vvlAppName.c_str(), vvlEngineName.c_str());
+        }
+
         createInfoFiltered.enabledExtensionCount = static_cast<uint32_t>(finalExts.size());
         createInfoFiltered.ppEnabledExtensionNames = finalExts.data();
         if (createInfoFiltered.pApplicationInfo != nullptr) {
@@ -1210,6 +1242,11 @@ class VkDecoderGlobalState::Impl {
 
         vk_struct_chain_filter<VkDebugReportCallbackCreateInfoEXT>(&createInfoFiltered);
         vk_struct_chain_filter<VkDebugUtilsMessengerCreateInfoEXT>(&createInfoFiltered);
+
+        if (debugContext) {
+            auto chainIter = vk_make_chain_iterator(&createInfoFiltered);
+            vk_append_struct(&chainIter, &debugInfo);
+        }
 
 #if defined(__APPLE__)
         if (m_vkEmulation->supportsPortabilityEnumeration()) {
@@ -1271,17 +1308,33 @@ class VkDecoderGlobalState::Impl {
             info.contextId = renderThreadInfo->ctx_id;
         }
 
-        VALIDATE_NEW_HANDLE_INFO_ENTRY(mInstanceInfo, *pInstance);
-        mInstanceInfo[*pInstance] = info;
+        if (debugContext) {
+            auto vk = dispatch_VkInstance(boxed);
+            if (vk && vk->vkCreateDebugUtilsMessengerEXT && vk->vkDestroyDebugUtilsMessengerEXT) {
+                VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+                VkResult messengerRes = vk->vkCreateDebugUtilsMessengerEXT(*pInstance, &debugInfo, nullptr, &messenger);
+                if (messengerRes == VK_SUCCESS) {
+                    info.debugMessenger = messenger;
+                } else {
+                    GFXSTREAM_WARNING("Failed to create Vulkan debug utils messenger: %s", string_VkResult(messengerRes));
+                }
+            }
+        }
 
         VimaWorkloadInspector::get().instanceCreated(*pInstance, info.applicationName,
                                                      info.engineName, info.isAngle);
 
-        *pInstance = (VkInstance)info.boxed;
+        uint64_t contextId = info.contextId;
+        info.debugContext = std::move(debugContext);
+
+        VALIDATE_NEW_HANDLE_INFO_ENTRY(mInstanceInfo, *pInstance);
+        mInstanceInfo[*pInstance] = std::move(info);
+
+        *pInstance = (VkInstance)boxed;
 
         if (vkCleanupEnabled()) {
             m_vkEmulation->getGlobalState()->registerProcessCleanupCallback(
-                unbox_VkInstance(boxed), info.contextId, [this, boxed] {
+                unbox_VkInstance(boxed), contextId, [this, boxed] {
                     if (snapshotsEnabled()) {
                         snapshot()->vkDestroyInstance(nullptr, kInvalidSnapshotApiCallHandle, nullptr, 0, boxed, nullptr);
                     }
@@ -3077,13 +3130,6 @@ class VkDecoderGlobalState::Impl {
             GFXSTREAM_FATAL("%s: function implementation cannot be found!");
         }
 
-        const VkFormat format = pInfo->pCreateInfo->format;
-        bool needDecompression = isEtc2(format) || isAstc(format);
-        if (!needDecompression) {
-            // No modifications needed
-            return;
-        }
-
         std::lock_guard<std::mutex> lock(mMutex);
 
         auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
@@ -3092,9 +3138,20 @@ class VkDecoderGlobalState::Impl {
             return;
         }
 
-        needDecompression = deviceInfo->needEmulatedDecompression(format);
+        auto* physicalDeviceInfo = gfxstream::base::find(mPhysdevInfo, deviceInfo->physicalDevice);
+        if (!physicalDeviceInfo) {
+            GFXSTREAM_ERROR("Failed to find physical device info for physical device:%p",
+                            deviceInfo->physicalDevice);
+            return;
+        }
+        auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
+
+        const VkFormat format = pInfo->pCreateInfo->format;
+        const bool needDecompression =
+            (isEtc2(format) || isAstc(format)) && deviceInfo->needEmulatedDecompression(format);
         if (!needDecompression) {
-            // No modifications needed
+            physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+                pInfo->pCreateInfo->tiling, &pMemoryRequirements->memoryRequirements);
             return;
         }
 
@@ -3117,6 +3174,34 @@ class VkDecoderGlobalState::Impl {
         pMemoryRequirements->memoryRequirements = cmpInfo.getMemoryRequirements();
         cmpInfo.destroy(vk);
 
+        physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+            pInfo->pCreateInfo->tiling, &pMemoryRequirements->memoryRequirements);
+    }
+
+    void on_vkGetDeviceBufferMemoryRequirements(gfxstream::base::BumpPool* pool,
+                                                VkSnapshotApiCallHandle apiCallHandle,
+                                                VkDevice boxed_device,
+                                                const VkDeviceBufferMemoryRequirements* pInfo,
+                                                VkMemoryRequirements2* pMemoryRequirements) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+
+        if (vk->vkGetDeviceBufferMemoryRequirements) {
+            vk->vkGetDeviceBufferMemoryRequirements(device, pInfo, pMemoryRequirements);
+        } else if (vk->vkGetDeviceBufferMemoryRequirementsKHR) {
+            vk->vkGetDeviceBufferMemoryRequirementsKHR(device, pInfo, pMemoryRequirements);
+        } else {
+            GFXSTREAM_FATAL("%s: function implementation cannot be found!", __func__);
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+
+        auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
+        if (!deviceInfo) {
+            GFXSTREAM_ERROR("%s: Failed to find device info for device: %p", __func__, device);
+            return;
+        }
+
         auto* physicalDeviceInfo = gfxstream::base::find(mPhysdevInfo, deviceInfo->physicalDevice);
         if (!physicalDeviceInfo) {
             GFXSTREAM_ERROR("Failed to find physical device info for physical device:%p",
@@ -3124,8 +3209,7 @@ class VkDecoderGlobalState::Impl {
             return;
         }
 
-        auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
-        physicalDeviceMemHelper->transformToGuestMemoryRequirements(
+        physicalDeviceInfo->memoryPropertiesHelper->transformToGuestMemoryRequirements(
             &pMemoryRequirements->memoryRequirements);
     }
 
@@ -5934,7 +6018,8 @@ class VkDecoderGlobalState::Impl {
 
         auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
         updateImageMemoryRequirementsLocked(device, image, pMemoryRequirements);
-        physicalDeviceMemHelper->transformToGuestMemoryRequirements(pMemoryRequirements);
+        physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+            imageTilingLocked(image), pMemoryRequirements);
     }
 
     // A driver that defers the layout also reports rowPitch=0; answer with the AHB's stride.
@@ -6000,8 +6085,8 @@ class VkDecoderGlobalState::Impl {
         auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
         updateImageMemoryRequirementsLocked(device, pInfo->image,
                                             &pMemoryRequirements->memoryRequirements);
-        physicalDeviceMemHelper->transformToGuestMemoryRequirements(
-            &pMemoryRequirements->memoryRequirements);
+        physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+            imageTilingLocked(pInfo->image), &pMemoryRequirements->memoryRequirements);
     }
 
     void on_vkGetBufferMemoryRequirements(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -7188,15 +7273,25 @@ class VkDecoderGlobalState::Impl {
 #endif
             } else if (m_vkEmulation->getFeatures().SystemBlob.enabled() ||
                        m_vkEmulation->getFeatures().VulkanAllocateHostVisibleAsUdmabuf.enabled()) {
+                // A system blob is imported as a host pointer, and a driver can ask for a
+                // coarser alignment than a page: Apple silicon pages are 16KB.
+                uint64_t blobAlignment = kPageSizeforBlob;
+                if (m_vkEmulation->supportsExternalMemoryHostProperties()) {
+                    blobAlignment = std::max<uint64_t>(blobAlignment,
+                                                       m_vkEmulation->externalMemoryHostProperties()
+                                                           .minImportedHostPointerAlignment);
+                }
+
                 // Ensure size is page-aligned.
-                VkDeviceSize alignedSize = ALIGN(localAllocInfo.allocationSize, kPageSizeforBlob);
+                VkDeviceSize alignedSize = ALIGN(localAllocInfo.allocationSize, blobAlignment);
                 if (alignedSize != localAllocInfo.allocationSize) {
                     GFXSTREAM_ERROR("Warning: Aligning allocation size from %llu to %llu",
                                     static_cast<unsigned long long>(localAllocInfo.allocationSize),
                                     static_cast<unsigned long long>(alignedSize));
                 }
                 localAllocInfo.allocationSize = alignedSize;
-                auto memory = SharedMemory("shared-memory-vk-" + std::to_string(sUniqueShmemId++),
+                auto memory = SharedMemory("shared-memory-vk-" + std::to_string(getpid()) + "-" +
+                                               std::to_string(sUniqueShmemId++),
                                            localAllocInfo.allocationSize);
 
                 if (m_vkEmulation->getFeatures().VulkanAllocateHostVisibleAsUdmabuf.enabled()) {
@@ -7241,8 +7336,7 @@ class VkDecoderGlobalState::Impl {
                         return VK_ERROR_OUT_OF_HOST_MEMORY;
                     }
                     mappedPtr = memory.get();
-                    int mappedPtrAlignment =
-                        reinterpret_cast<uintptr_t>(mappedPtr) % kPageSizeforBlob;
+                    int mappedPtrAlignment = reinterpret_cast<uintptr_t>(mappedPtr) % blobAlignment;
                     if (mappedPtrAlignment != 0) {
                         GFXSTREAM_ERROR(
                             "Warning: Mapped shared memory pointer is not aligned to page size, "
@@ -10940,6 +11034,11 @@ class VkDecoderGlobalState::Impl {
         return false;
     }
 
+    VkImageTiling imageTilingLocked(VkImage image) REQUIRES(mMutex) {
+        auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+        return imageInfo ? imageInfo->imageCreateInfoShallow.tiling : VK_IMAGE_TILING_OPTIMAL;
+    }
+
     void updateImageMemoryRequirementsLocked(VkDevice device, VkImage image,
                                              VkMemoryRequirements* pMemoryRequirements)
         REQUIRES(mMutex) {
@@ -11505,6 +11604,13 @@ class VkDecoderGlobalState::Impl {
 
         for (InstanceObjects::DeviceObjects& deviceObjects : objects.devices) {
             destroyDeviceObjects(deviceObjects);
+        }
+
+        if (instanceInfo.debugMessenger != VK_NULL_HANDLE) {
+            auto vk = dispatch_VkInstance(instanceInfo.boxed);
+            if (vk && vk->vkDestroyDebugUtilsMessengerEXT) {
+                vk->vkDestroyDebugUtilsMessengerEXT(instance, instanceInfo.debugMessenger, nullptr);
+            }
         }
 
         m_vk->vkDestroyInstance(instance, nullptr);
@@ -12217,6 +12323,20 @@ void VkDecoderGlobalState::on_vkGetDeviceImageMemoryRequirementsKHR(
     const VkDeviceImageMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
     mImpl->on_vkGetDeviceImageMemoryRequirements(pool, apiCallHandle, device, pInfo,
                                                  pMemoryRequirements);
+}
+
+void VkDecoderGlobalState::on_vkGetDeviceBufferMemoryRequirements(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkDeviceBufferMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
+    mImpl->on_vkGetDeviceBufferMemoryRequirements(pool, apiCallHandle, device, pInfo,
+                                                  pMemoryRequirements);
+}
+
+void VkDecoderGlobalState::on_vkGetDeviceBufferMemoryRequirementsKHR(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkDeviceBufferMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
+    mImpl->on_vkGetDeviceBufferMemoryRequirements(pool, apiCallHandle, device, pInfo,
+                                                  pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkDestroyDevice(gfxstream::base::BumpPool* pool,
